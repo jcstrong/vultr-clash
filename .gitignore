@@ -1,0 +1,13 @@
+# 运行时状态（含密钥/密码/计费记录）
+.state/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# API Key 证书等本地文件
+api_key
+api_key*
+
+# Clash 订阅产物（运行时生成）
+clash.yaml

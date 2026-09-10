@@ -1,0 +1,25 @@
+#cloud-config
+
+write_files:
+  - path: /etc/shadowsocks-libev/config.json
+    permissions: "0644"
+    content: |
+      {
+        "server": "0.0.0.0",
+        "server_port": 8388,
+        "method": "aes-256-gcm",
+        "password": "__SS_PASSWORD__",
+        "mode": "tcp_and_udp",
+        "timeout": 300,
+        "fast_open": false,
+        "no_delay": true
+      }
+
+runcmd:
+  - apt-get update -y >/dev/null 2>&1
+  - apt-get install -y shadowsocks-libev >/dev/null 2>&1
+  - ufw allow 8388/tcp >/dev/null 2>&1 || true
+  - ufw allow 8388/udp >/dev/null 2>&1 || true
+  - systemctl enable shadowsocks-libev >/dev/null 2>&1
+  - systemctl restart shadowsocks-libev || ss-server -c /etc/shadowsocks-libev/config.json -f /tmp/ss.pid
+  - curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8388 || true

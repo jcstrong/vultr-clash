@@ -24,6 +24,7 @@ STATE_DIR = os.path.join(BASE_DIR, ".state")
 TOKEN_FILE = os.path.join(STATE_DIR, "sub_token")
 SUB_CLASH_PATH = os.environ.get("SUB_PATH", "/sub/clash.yaml").lstrip("/")
 VERSION_FILE = os.path.join(BASE_DIR, "VERSION")
+SCHEDULE_FILE = os.path.join(STATE_DIR, "schedule.json")
 
 def read_version():
     try:
@@ -57,6 +58,74 @@ def resolve_sub_url():
     if "/" + SUB_CLASH_PATH in base:
         base = base[: base.find("/" + SUB_CLASH_PATH)]
     return f"{base}/sub/{token}/clash.yaml"
+
+# --- 定时任务（自动销毁/自动创建 + Bark 通知）---
+SCHEDULE_DEFAULT = {
+    "enabled": True,            # 总开关（销毁与创建都受它控制）
+    "destroy_time": "00:30",   # 每天自动销毁时刻；置 null 可单独停用销毁
+    "create_time": None,       # 预留：每天自动创建时刻；null = 未启用
+    "bark_url": "",            # Bark 推送地址，如 https://api.day.app/<你的Key>
+    "create_region": "ewr",   # 自动创建时使用的地区/套餐
+    "create_plan": "vc2-1c-0.5gb",
+    "last_destroy_date": "",  # 调度器记账，勿手改
+    "last_create_date": "",
+}
+
+def load_schedule():
+    sched = dict(SCHEDULE_DEFAULT)
+    try:
+        with open(SCHEDULE_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            sched.update(saved)
+    except (OSError, ValueError):
+        pass
+    return sched
+
+def save_schedule(sched):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+        json.dump(sched, f, ensure_ascii=False, indent=2)
+    os.chmod(SCHEDULE_FILE, 0o600)
+
+def bark_notify(title, body):
+    """通过 Bark 推送到手机；未配置时仅写日志。返回是否成功"""
+    url = (load_schedule().get("bark_url") or "").strip()
+    if not url:
+        append_log("⚠ 未配置 bark_url（.state/schedule.json），跳过 Bark 通知")
+        return False
+    payload = json.dumps({"title": title, "body": body, "group": "vultr-clash"})
+    try:
+        r = subprocess.run(
+            ["curl", "-4", "-sS", "--fail-with-body", "--max-time", "10",
+             "-X", "POST", "-H", "Content-Type: application/json",
+             "-d", payload, url],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if r.returncode == 0:
+            append_log(f"✓ Bark 通知已发送: {title}")
+            return True
+        append_log(f"✗ Bark 推送失败: {(r.stderr or r.stdout).strip()[:120]}")
+        return False
+    except Exception as e:
+        append_log(f"✗ Bark 推送异常: {e}")
+        return False
+
+def node_exists():
+    """Vultr 账号下是否有实例：True/False；API 异常时返回 None（调用方应重试而非跳过）"""
+    try:
+        return bool(get_vultr_instances())
+    except Exception as e:
+        append_log(f"⚠ 定时任务查询实例失败: {e}")
+        return None
+
+def total_spent_str():
+    """读取计费台账累计消耗（用于通知文案，失败返回空串）"""
+    try:
+        with open(BILL_FILE, encoding="utf-8") as f:
+            return f"，累计消耗 ${json.load(f).get('total_spent', 0.0):.2f}"
+    except Exception:
+        return ""
 
 PLAN_HOURLY = {
     "vc2-1c-0.5gb": 3.5 / 720.0,
@@ -467,6 +536,66 @@ def run_action(action, region="", plan=""):
         release_action_lock()
         action_lock.release()
 
+def scheduler_loop():
+    """定时调度线程：按 schedule.json 自动销毁/创建节点。
+    - 每 20 秒轮询一次，重新读取配置（改 schedule.json 无需重启）
+    - 命中目标时刻且当天未执行过才触发；触发时有任务在跑则同分钟内重试
+    - 销毁/创建的结果通过 Bark 通知（已配置时）；无节点则静默跳过
+    """
+    append_log("⏰ 定时调度器已启动")
+    while True:
+        try:
+            sched = load_schedule()
+            if sched.get("enabled"):
+                now_hm = time.strftime("%H:%M")
+                today = time.strftime("%Y-%m-%d")
+
+                # ---- 自动销毁 ----
+                dt = (sched.get("destroy_time") or "").strip()
+                if dt and now_hm == dt and sched.get("last_destroy_date") != today:
+                    exists = node_exists()
+                    if exists is False:
+                        append_log(f"⏰ {dt} 定时销毁：当前无节点，跳过")
+                        sched["last_destroy_date"] = today
+                        save_schedule(sched)
+                    elif exists is True:
+                        res = run_action("destroy")
+                        busy = res.get("exit") == -1 and "正在执行" in (res.get("output") or "")
+                        if not busy:
+                            sched["last_destroy_date"] = today
+                            save_schedule(sched)
+                            if res.get("ok"):
+                                bark_notify("✅ 节点已自动销毁",
+                                            f"定时任务（{dt}）已销毁节点并结算计费{total_spent_str()}，订阅已停止")
+                            else:
+                                bark_notify("❌ 自动销毁失败",
+                                            ((res.get("output") or "")[:200] or "详见管理页日志") + " — 节点仍在计费，请手动处理")
+                        # busy：不标记日期，20 秒后在本分钟内重试
+
+                # ---- 自动创建（预留）----
+                ct = (sched.get("create_time") or "").strip()
+                if ct and now_hm == ct and sched.get("last_create_date") != today:
+                    exists = node_exists()
+                    if exists is True:
+                        append_log(f"⏰ {ct} 定时创建：已有节点，跳过")
+                        sched["last_create_date"] = today
+                        save_schedule(sched)
+                    elif exists is False:
+                        res = run_action("create",
+                                         sched.get("create_region") or "ewr",
+                                         sched.get("create_plan") or "vc2-1c-0.5gb")
+                        busy = res.get("exit") == -1 and "正在执行" in (res.get("output") or "")
+                        if not busy:
+                            sched["last_create_date"] = today
+                            save_schedule(sched)
+                            if res.get("ok"):
+                                bark_notify("✅ 节点已自动创建", f"定时任务（{ct}）创建完成，订阅已更新")
+                            else:
+                                bark_notify("❌ 自动创建失败", (res.get("output") or "")[:200] or "详见管理页日志")
+        except Exception as e:
+            append_log(f"✗ 定时调度器异常: {e}")
+        time.sleep(20)
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -581,6 +710,36 @@ select:focus{outline:none;border-color:var(--accent)}
 
 <div class="container">
 
+  <div class="action-card">
+    <div class="row">
+      <select id="region">
+        <option value="ewr" selected>ewr · 新泽西 (New Jersey)</option>
+        <option value="nrt">nrt · 东京 (Tokyo)</option>
+        <option value="sgp">sgp · 新加坡 (Singapore)</option>
+        <option value="icn">icn · 首尔 (Seoul)</option>
+        <option value="lax">lax · 洛杉矶 (LA)</option>
+        <option value="fra">fra · 法兰克福 (Frankfurt)</option>
+      </select>
+      <select id="plan">
+        <option value="vc2-1c-0.5gb" selected>$3.5/mo · 512MB</option>
+        <option value="vc2-1c-1gb">$5/mo · 1GB</option>
+      </select>
+    </div>
+    <button class="btn btn-primary btn-full" id="createBtn" onclick="doAction('create')">创建节点</button>
+    <div style="height:8px"></div>
+    <button class="btn btn-green btn-full" id="updateBtn" onclick="doAction('update')" disabled>等待初始化…</button>
+    <div style="height:8px"></div>
+    <button class="btn btn-danger btn-full" id="destroyBtn" onclick="doAction('destroy')">销毁节点</button>
+  </div>
+
+  <div class="log-card">
+    <div class="log-header">
+      <h3>操作日志</h3>
+      <span style="font-size:12px;color:var(--muted)" id="logTime"></span>
+    </div>
+    <div class="log-body" id="logBody">__PROGRESS_LOG__</div>
+  </div>
+
   <div class="sub-card">
     <div class="sub-label">订阅链接 (固定不变 · Shadowrocket / Clash)</div>
     <div class="sub-url-wrap" onclick="copySub()" id="subWrap" title="点击复制">
@@ -619,34 +778,16 @@ select:focus{outline:none;border-color:var(--accent)}
     </dl>
   </div>
 
-  <div class="action-card">
-    <div class="row">
-      <select id="region">
-        <option value="ewr" selected>ewr · 新泽西 (New Jersey)</option>
-        <option value="nrt">nrt · 东京 (Tokyo)</option>
-        <option value="sgp">sgp · 新加坡 (Singapore)</option>
-        <option value="icn">icn · 首尔 (Seoul)</option>
-        <option value="lax">lax · 洛杉矶 (LA)</option>
-        <option value="fra">fra · 法兰克福 (Frankfurt)</option>
-      </select>
-      <select id="plan">
-        <option value="vc2-1c-0.5gb" selected>$3.5/mo · 512MB</option>
-        <option value="vc2-1c-1gb">$5/mo · 1GB</option>
-      </select>
+  <div class="node-card">
+    <div class="node-header">
+      <span class="node-name">⏰ 定时任务</span>
+      <span class="node-status on" title="点击刷新" onclick="loadSchedule()" style="cursor:pointer">刷新</span>
     </div>
-    <button class="btn btn-primary btn-full" id="createBtn" onclick="doAction('create')">创建节点</button>
-    <div style="height:8px"></div>
-    <button class="btn btn-green btn-full" id="updateBtn" onclick="doAction('update')" disabled>等待初始化…</button>
-    <div style="height:8px"></div>
-    <button class="btn btn-danger btn-full" id="destroyBtn" onclick="doAction('destroy')">销毁节点</button>
-  </div>
-
-  <div class="log-card">
-    <div class="log-header">
-      <h3>操作日志</h3>
-      <span style="font-size:12px;color:var(--muted)" id="logTime"></span>
-    </div>
-    <div class="log-body" id="logBody">__PROGRESS_LOG__</div>
+    <dl class="node-info" id="scheduleInfo">
+      <dt>自动销毁</dt><dd id="scDestroy">加载中…</dd>
+      <dt>自动创建</dt><dd id="scCreate">加载中…</dd>
+      <dt>销毁通知</dt><dd id="scBark">加载中…</dd>
+    </dl>
   </div>
 
 </div>
@@ -910,6 +1051,24 @@ async function loadCost() {
   }
 }
 
+async function loadSchedule() {
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"schedule"})});
+    const j = await r.json();
+    const s = j.schedule || {};
+    const on = s.enabled !== false;
+    document.getElementById('scDestroy').textContent =
+      (on && s.destroy_time) ? ('每天 ' + s.destroy_time + '（销毁并结算计费）') : '未启用';
+    document.getElementById('scCreate').textContent =
+      (on && s.create_time) ? ('每天 ' + s.create_time) : '未启用（预留）';
+    document.getElementById('scBark').textContent =
+      s.bark_configured ? 'Bark 已配置，销毁结果推送到手机' : '未配置（编辑 .state/schedule.json 的 bark_url）';
+  } catch(e) {
+    document.getElementById('scDestroy').textContent = '查询失败';
+  }
+}
+
 // Enter 键保存 API Key
 document.getElementById('keyInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') saveKey();
@@ -919,6 +1078,7 @@ document.getElementById('keyInput').addEventListener('keydown', e => {
 loadStatus();
 loadCost();
 loadLog();
+loadSchedule();
 
 // 操作执行期间由 doAction 内部轮询日志；无操作时不再自动刷新
 </script>
@@ -987,6 +1147,14 @@ class Handler(BaseHTTPRequestHandler):
                 resp = {"ok": True, "billing": get_billing()}
             except Exception as e:
                 resp = {"ok": False, "output": str(e)}
+        elif action == "schedule":
+            sched = load_schedule()
+            resp = {"ok": True, "schedule": {
+                "enabled": bool(sched.get("enabled")),
+                "destroy_time": (sched.get("destroy_time") or "").strip(),
+                "create_time": (sched.get("create_time") or "").strip(),
+                "bark_configured": bool((sched.get("bark_url") or "").strip()),
+            }}
         elif action in ["connect", "status"]:
             sub_url = resolve_sub_url()
             try:
@@ -1031,6 +1199,13 @@ def main():
     print(f"平台: {platform.platform()} ({platform.machine()})")
     print(f"WebUI: http://{host}:{port}/")
     print(f"Sub:   {resolve_sub_url()}")
+    sched = load_schedule()
+    print(f"定时:  销毁={sched.get('destroy_time')} 创建={sched.get('create_time') or '未启用'}"
+          f" Bark={'已配置' if (sched.get('bark_url') or '').strip() else '未配置'}")
+    # 首次运行生成默认调度配置；启动调度线程
+    if not os.path.exists(SCHEDULE_FILE):
+        save_schedule(dict(SCHEDULE_DEFAULT))
+    threading.Thread(target=scheduler_loop, daemon=True).start()
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 if __name__ == "__main__":

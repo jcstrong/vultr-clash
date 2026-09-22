@@ -11,3 +11,7 @@ api_key*
 
 # Clash 订阅产物（运行时生成）
 clash.yaml
+# DOM 测试与备份遗留
+node_modules/
+package-lock.json
+*.bak

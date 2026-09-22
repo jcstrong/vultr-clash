@@ -2,7 +2,12 @@
 import json
 import html
 import os
+import platform
+import re
+import secrets
+import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +20,43 @@ LOCK_FILE = os.path.join(BASE_DIR, ".state", "action.lock")
 TIME_FILE = os.path.join(BASE_DIR, ".state", "create-duration.txt")
 BILL_FILE = os.path.join(BASE_DIR, ".state", "billing.json")
 SUB_URL = os.environ.get("SUB_URL", "http://localhost:8888/sub/clash.yaml")
+STATE_DIR = os.path.join(BASE_DIR, ".state")
+TOKEN_FILE = os.path.join(STATE_DIR, "sub_token")
+SUB_CLASH_PATH = os.environ.get("SUB_PATH", "/sub/clash.yaml").lstrip("/")
+VERSION_FILE = os.path.join(BASE_DIR, "VERSION")
+
+def read_version():
+    try:
+        with open(VERSION_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return "0.0.0"
+
+def read_sub_token():
+    try:
+        with open(TOKEN_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+def rotate_sub_token():
+    """轮换订阅 token: 旧链接立即失效, 新链接需重新填入客户端"""
+    token = secrets.token_urlsafe(24)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+        f.write(token + "\n")
+    os.chmod(TOKEN_FILE, 0o600)
+    return token
+
+def resolve_sub_url():
+    """订阅链接: 启用 token 鉴权时升级为 /sub/{token}/clash.yaml"""
+    base = SUB_URL.rstrip("/")
+    token = read_sub_token()
+    if not token:
+        return base
+    if "/" + SUB_CLASH_PATH in base:
+        base = base[: base.find("/" + SUB_CLASH_PATH)]
+    return f"{base}/sub/{token}/clash.yaml"
 
 PLAN_HOURLY = {
     "vc2-1c-0.5gb": 3.5 / 720.0,
@@ -123,6 +165,64 @@ def get_billing():
         "total_all": round(history_total + current_cost, 4),
     }
 
+def validate_api_key(key):
+    """校验 Vultr API Key: 调用 /v2/account 确认有效后才允许保存"""
+    key = (key or "").strip()
+    if not key:
+        return {"ok": False, "output": "未填写 API Key"}
+    r = subprocess.run(
+        ["curl", "-4", "-sS", "--fail-with-body",
+         "-H", f"Authorization: Bearer {key}",
+         "https://api.vultr.com/v2/account"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    if r.returncode == 0:
+        try:
+            a = json.loads(r.stdout).get("account", {})
+        except Exception:
+            a = {}
+        return {"ok": True, "account": a}
+    msg = (r.stderr.strip() or r.stdout.strip() or "校验失败")[:200]
+    try:
+        err = json.loads(r.stdout).get("error", "")
+        if err:
+            msg = err[:200]
+    except Exception:
+        pass
+    return {"ok": False, "output": msg}
+
+def run_selftest():
+    """环境自检: 依赖二进制 / 平台 / Tailscale IP / API Key 是否存在"""
+    items = [
+        ("curl", "调用 Vultr API"),
+        ("jq", "JSON 解析"),
+        ("python3", "运行 webui/serve_sub"),
+        ("openssl", "生成 SS 密码"),
+        ("nc", "端口探活(可选)"),
+        ("sshpass", "密码 SSH(缺失时回退 expect)"),
+        ("expect", "密码 SSH 兜底(macOS 自带)"),
+        ("tailscale", "订阅私有分发(可选)"),
+    ]
+    checks = []
+    for name, desc in items:
+        p = shutil.which(name)
+        checks.append({"name": name, "desc": desc, "present": bool(p), "path": p or ""})
+    ts_ip = ""
+    ts = shutil.which("tailscale")
+    if ts:
+        r = subprocess.run([ts, "ip", "-4"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            ts_ip = (r.stdout.strip().split("\n") or [""])[0]
+    return {
+        "ok": True,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "python": ".".join(map(str, sys.version_info[:3])),
+        "checks": checks,
+        "tailscale_ip": ts_ip,
+        "vultr_key_ok": bool(get_api_key()),
+    }
+
 def get_instance_status():
     instances = get_vultr_instances()
     if not instances:
@@ -164,7 +264,7 @@ def render_page():
     page = PAGE
     for marker, value in values.items():
         page = page.replace(marker, html.escape(str(value)))
-    page = page.replace("__SUB_URL__", html.escape(SUB_URL))
+    page = page.replace("__SUB_URL__", html.escape(resolve_sub_url()))
     page = page.replace("__PROGRESS_LOG__", html.escape(read_log()))
 
     # 费用信息 SSR 占位：真实数据由前端 loadCost() 加载
@@ -172,6 +272,82 @@ def render_page():
     page = page.replace("__COST_CURRENT__", "-")
     page = page.replace("__COST_HISTORY__", "-")
     return page
+
+def render_setup_page():
+    page = SETUP_PAGE
+    page = page.replace("__VERSION__", html.escape(read_version()))
+    page = page.replace("__SUB_URL_HINT__", html.escape(resolve_sub_url()))
+    return page
+
+SETUP_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vultr-clash 初始化</title>
+<style>
+:root{--bg:#0f1117;--card:#161a23;--border:#262c3a;--text:#e6e6e6;--muted:#888;--accent:#2f6fed;--green:#4ade80}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"SF Pro","Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:24px}
+.wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:460px;width:100%}
+h1{font-size:18px;margin-bottom:6px}
+.sub{font-size:12px;color:var(--muted);margin-bottom:20px;line-height:1.5}
+label{display:block;font-size:13px;color:var(--muted);margin-bottom:8px}
+input{width:100%;background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:12px;color:#fff;font-size:13px;font-family:monospace;margin-bottom:12px}
+input:focus{outline:none;border-color:var(--accent)}
+.btns{display:flex;gap:8px;margin-bottom:12px}
+.btn{flex:1;border:none;border-radius:8px;padding:11px;font-size:14px;font-weight:500;cursor:pointer;color:#fff;transition:all .12s}
+.btn:active{transform:scale(.97)}
+.btn-p{background:var(--accent)}.btn-s{background:#2b3245;border:1px solid var(--border);color:#ddd}
+pre{background:#0a0c11;border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;line-height:1.6;color:#aaa;white-space:pre-wrap;word-break:break-all;min-height:20px;max-height:240px;overflow:auto}
+.ok{color:var(--green)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⚡ vultr-clash v__VERSION__</h1>
+  <div class="sub">管理面板尚未配置 Vultr API Key。填写后将自动校验，通过后进入管理页。<br>预计订阅链接形如: __SUB_URL_HINT__</div>
+  <label>Vultr API Key（在 my.vultr.com/settings 创建）</label>
+  <input type="password" id="key" placeholder="粘贴 API Key" autocomplete="off">
+  <div class="btns">
+    <button class="btn btn-s" onclick="runSelftest()">环境自检</button>
+    <button class="btn btn-p" onclick="saveKey()">保存并校验</button>
+  </div>
+  <pre id="out">就绪。可先运行「环境自检」确认依赖齐全。</pre>
+</div>
+<script>
+async function api(payload) {
+  const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(payload)});
+  return r.json();
+}
+async function saveKey() {
+  const key = document.getElementById('key').value.trim();
+  const out = document.getElementById('out');
+  if (!key) { out.textContent = '请先粘贴 API Key'; return; }
+  out.textContent = '校验中…';
+  const j = await api({action:'savekey', key});
+  if (j.ok) {
+    out.innerHTML = '<span class="ok">✓ API Key 有效并已保存</span>，即将进入管理页…';
+    setTimeout(() => location.reload(), 800);
+  } else {
+    out.textContent = '✗ 校验失败: ' + (j.output || '未知错误');
+  }
+}
+async function runSelftest() {
+  const out = document.getElementById('out');
+  out.textContent = '自检中…';
+  const j = await api({action:'selftest'});
+  const lines = ['平台: ' + (j.platform||''), '机器: ' + (j.machine||'') + ' · Python ' + (j.python||'')];
+  (j.checks||[]).forEach(c => lines.push((c.present?'✓ ':'✗ ') + c.name + (c.path?' ('+c.path+')':'') + ' — ' + (c.desc||'')));
+  if (j.tailscale_ip) lines.push('Tailscale IP: ' + j.tailscale_ip);
+  if (j.vultr_key_ok) lines.push('Vultr API Key: 已配置');
+  out.textContent = lines.join('\n');
+}
+document.getElementById('key').addEventListener('keydown', e => { if (e.key === 'Enter') saveKey(); });
+</script>
+</body>
+</html>"""
 
 def append_log(msg):
     """追加日志到持久化文件"""
@@ -244,6 +420,7 @@ def run_action(action, region="", plan=""):
         
         env = dict(os.environ)
         env["VULTR_API_KEY"] = get_api_key()
+        env["SUB_URL"] = resolve_sub_url()
         cmd = ["bash", SCRIPT, action]
         if region:
             cmd.append(region)
@@ -479,9 +656,11 @@ select:focus{outline:none;border-color:var(--accent)}
   <div class="modal">
     <h3>设置 Vultr API Key</h3>
     <input type="password" id="keyInput" placeholder="粘贴你的 Vultr API Key">
+    <div id="selfMsg" style="font-size:12px;color:var(--muted);margin:2px 0 12px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto"></div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" onclick="hideModal()">取消</button>
+      <button class="btn btn-secondary" onclick="runSelftest()">环境自检</button>
       <button class="btn btn-primary" onclick="saveKey()">保存</button>
+      <button class="btn btn-secondary" onclick="hideModal()">取消</button>
     </div>
   </div>
 </div>
@@ -505,9 +684,26 @@ async function saveKey() {
   const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({action:"savekey", key})});
   const j = await r.json();
+  const box = document.getElementById('selfMsg');
+  if (box) box.textContent = j.ok ? '✓ API Key 有效并已保存' : ('✗ ' + (j.output || '校验失败'));
   if (j.ok) {
-    hideModal();
-    loadStatus();
+    setTimeout(() => { hideModal(); loadStatus(); }, 600);
+  }
+}
+
+async function runSelftest() {
+  const box = document.getElementById('selfMsg');
+  if (box) box.textContent = '自检中…';
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"selftest"})});
+    const j = await r.json();
+    const lines = ['平台: ' + (j.platform||''), '机器: ' + (j.machine||'') + ' · Python ' + (j.python||'')];
+    (j.checks||[]).forEach(c => lines.push((c.present?'✓ ':'✗ ') + c.name + (c.path?' ('+c.path+')':'') + ' — ' + (c.desc||'')));
+    if (j.tailscale_ip) lines.push('Tailscale IP: ' + j.tailscale_ip);
+    if (box) box.textContent = lines.join('\n');
+  } catch(e) {
+    if (box) box.textContent = '自检失败: ' + e.message;
   }
 }
 
@@ -748,13 +944,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(404); self.end_headers()
                 self.wfile.write(b"no active node")
             return
+        page_content = render_setup_page() if not get_api_key() else render_page()
+        page_bytes = page_content.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page_bytes)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
         self.end_headers()
-        self.wfile.write(render_page().encode())
+        self.wfile.write(page_bytes)
 
     def do_POST(self):
         if not self.path.startswith("/api"):
@@ -767,19 +966,29 @@ class Handler(BaseHTTPRequestHandler):
         action = data.get("action", "")
         
         if action == "savekey":
-            save_api_key(data.get("key", ""))
-            resp = {"ok": bool(data.get("key"))}
+            key = (data.get("key") or "").strip()
+            res = validate_api_key(key)
+            if res["ok"]:
+                save_api_key(key)
+                append_log("✓ API Key 已保存并校验通过")
+            resp = res
         elif action == "getlog":
             resp = {"ok": True, "log": read_log()}
         elif action == "isbusy":
             resp = {"ok": True, "busy": is_action_running()}
+        elif action == "selftest":
+            resp = run_selftest()
+        elif action == "rotatetoken":
+            token = rotate_sub_token()
+            resp = {"ok": True, "token": token, "subscription_url": resolve_sub_url(),
+                    "note": "旧订阅链接已失效，请用新链接重新订阅"}
         elif action == "cost":
             try:
                 resp = {"ok": True, "billing": get_billing()}
             except Exception as e:
                 resp = {"ok": False, "output": str(e)}
         elif action in ["connect", "status"]:
-            sub_url = SUB_URL
+            sub_url = resolve_sub_url()
             try:
                 resp = {"ok": True, "instance": get_instance_status(), "subscription_url": sub_url}
             except Exception as e:
@@ -805,6 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(resp, ensure_ascii=False).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -814,11 +1024,13 @@ def main():
     os.makedirs(os.path.join(BASE_DIR, ".state"), exist_ok=True)
     if not os.path.exists(LOG_FILE):
         append_log("系统启动")
-    
+
     host = os.environ.get("VULTR_WEB_HOST", "0.0.0.0")
     port = int(os.environ.get("VULTR_WEB_PORT", "8333"))
+    print(f"vultr-clash webui v{read_version()}")
+    print(f"平台: {platform.platform()} ({platform.machine()})")
     print(f"WebUI: http://{host}:{port}/")
-    print(f"Sub:   {SUB_URL}")
+    print(f"Sub:   {resolve_sub_url()}")
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 if __name__ == "__main__":

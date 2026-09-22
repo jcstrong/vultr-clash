@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>SS Node Manager</title>
+<style>
+:root{--bg:#0f1117;--card:#161a23;--border:#262c3a;--text:#e6e6e6;--muted:#888;--accent:#2f6fed;--green:#1f7a3d;--red:#a33;--radius:12px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"SF Pro","Segoe UI",Roboto,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100dvh}
+
+/* 顶栏 */
+header{background:linear-gradient(135deg,#1a2030,#161a23);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+header h1{font-size:18px;font-weight:600;white-space:nowrap}
+.header-right{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer;transition:all .15s}
+.badge:hover{border-color:var(--accent)}
+.badge .dot{width:8px;height:8px;border-radius:50%;background:#555}
+.badge .dot.on{background:#4ade80;box-shadow:0 0 6px #4ade8060}
+.badge .dot.off{background:#f87171}
+
+/* 主体 */
+.container{max-width:600px;margin:0 auto;padding:20px 16px 40px}
+
+/* 订阅卡片 */
+.sub-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;text-align:center;position:relative;overflow:hidden}
+.sub-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent),#4ade80)}
+.sub-label{font-size:12px;color:var(--muted);margin-bottom:10px;letter-spacing:1px;text-transform:uppercase}
+.sub-url-wrap{position:relative;background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:12px 44px 12px 12px;cursor:pointer;transition:all .15s}
+.sub-url-wrap:hover{border-color:var(--accent)}
+.sub-url-text{font-family:ui-monospace,"SF Mono","Cascadia Mono",monospace;font-size:13px;color:#7ec8ff;word-break:break-all;line-height:1.4}
+.sub-url-mask{font-family:ui-monospace,"SF Mono",monospace;font-size:14px;color:#7ec8ff;letter-spacing:2px}
+.copy-btn{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:var(--accent);border:none;border-radius:6px;padding:6px 10px;font-size:12px;color:#fff;cursor:pointer;transition:all .15s}
+.copy-btn:hover{background:#1e57d4}
+.copy-btn:active{transform:translateY(-50%) scale(.95)}
+.copy-hint{font-size:11px;color:var(--muted);margin-top:8px;transition:opacity .3s}
+.copy-hint.show{color:#4ade80}
+
+/* 节点状态 */
+.node-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px;margin-bottom:16px}
+.node-card.active{border-color:#4ade8040;background:linear-gradient(135deg,#0d1a0d,#161a23)}
+.node-card.inactive{border-color:var(--border);opacity:.7}
+.node-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.node-name{font-size:15px;font-weight:500}
+.node-status{font-size:12px;padding:3px 10px;border-radius:20px;font-weight:500}
+.node-status.on{background:#4ade8020;color:#4ade80;border:1px solid #4ade8040}
+.node-status.off{background:#f8717120;color:#f87171;border:1px solid #f8717140}
+.node-info{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px}
+.node-info dt{color:var(--muted);white-space:nowrap}
+.node-info dd{font-family:ui-monospace,monospace;word-break:break-all;color:#ccc}
+
+/* 操作区 */
+.action-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+select{flex:1;min-width:0;background:#1d2029;color:#fff;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:14px;cursor:pointer}
+select:focus{outline:none;border-color:var(--accent)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:none;border-radius:8px;padding:11px 20px;font-size:14px;font-weight:500;cursor:pointer;transition:all .12s;flex:1;min-width:0}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#1e57d4}
+.btn-secondary{background:#2b3245;color:#ddd;border:1px solid var(--border)}.btn-secondary:hover{background:#37415a}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#c22}
+.btn-green{background:var(--green);color:#fff}.btn-green:hover{background:#166030}
+.btn-full{width:100%;flex:none}
+
+/* 日志 */
+.log-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-bottom:16px}
+.log-header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border)}
+.log-header h3{font-size:14px;font-weight:500;color:var(--muted)}
+.log-body{background:#0a0c11;padding:12px 16px;max-height:260px;overflow:auto;font-size:12px;line-height:1.6;font-family:ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;color:#aaa;min-height:60px}
+.log-body::-webkit-scrollbar{width:6px}
+.log-body::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+
+/* API Key 弹窗 */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center;padding:20px}
+.modal-overlay.show{display:flex}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:24px;width:100%;max-width:420px}
+.modal h3{font-size:16px;margin-bottom:16px}
+.modal input{width:100%;background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;font-family:monospace;margin-bottom:12px}
+.modal input:focus{outline:none;border-color:var(--accent)}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end}
+
+/* Loading spinner */
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner-lg{width:20px;height:20px;border-width:3px}
+
+/* 移动端适配 */
+@media(max-width:480px){
+  header{padding:12px 16px}
+  header h1{font-size:16px}
+  .container{padding:16px 12px 32px}
+  .sub-card{padding:16px 14px}
+  .node-card{padding:14px 16px}
+  .action-card{padding:16px 14px}
+  .btn{padding:12px 16px;font-size:13px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ SS 节点管理</h1>
+  <div class="header-right">
+    <div class="badge" id="nodeBadge" onclick="loadStatus()" title="点击刷新节点状态">
+      <span class="dot off" id="nodeDot"></span>
+      <span id="nodeLabel">加载中…</span>
+    </div>
+    <div class="badge" onclick="showModal()" title="设置 API Key">🔑 API Key</div>
+  </div>
+</header>
+
+<div class="container">
+
+  <div class="sub-card">
+    <div class="sub-label">订阅链接 (固定不变 · Shadowrocket / Clash)</div>
+    <div class="sub-url-wrap" onclick="copySub()" id="subWrap" title="点击复制">
+      <div class="sub-url-mask" id="subDisplay">http://100.90.80.9:8888/sub/clash.yaml</div>
+      <button class="copy-btn" id="copyBtn">复制</button>
+    </div>
+    <div class="copy-hint" id="copyHint">✓ 已复制到剪贴板</div>
+  </div>
+
+  <div class="node-card inactive" id="nodeCard">
+    <div class="node-header">
+      <span class="node-name" id="nodeName">加载中…</span>
+      <span style="display:flex;gap:8px;align-items:center">
+        <span class="node-status off" id="nodeStatus">…</span>
+        <span class="node-status on" title="点击刷新节点状态" onclick="loadStatus()" style="cursor:pointer">刷新</span>
+      </span>
+    </div>
+    <dl class="node-info" id="nodeInfo">
+      <dt>地区</dt><dd id="niRegion">-</dd>
+      <dt>套餐</dt><dd id="niPlan">-</dd>
+      <dt>IP</dt><dd id="niIP">-</dd>
+      <dt>密码</dt><dd id="niPass">-</dd>
+      <dt>创建用时</dt><dd id="niCreateTime">-</dd>
+    </dl>
+  </div>
+
+  <div class="node-card cost-card">
+    <div class="node-header">
+      <span class="node-name">💰 费用信息</span>
+      <span class="node-status on" id="costRefresh" title="点击刷新" onclick="loadCost()">刷新</span>
+    </div>
+    <dl class="node-info" id="costInfo">
+      <dt>余额</dt><dd id="coBalance">加载中…</dd>
+      <dt>当前节点费用</dt><dd id="coCurrent">-</dd>
+      <dt>历史节点消耗</dt><dd id="coHistory">-</dd>
+    </dl>
+  </div>
+
+  <div class="action-card">
+    <div class="row">
+      <select id="region">
+        <option value="ewr" selected>ewr · 新泽西 (New Jersey)</option>
+        <option value="nrt">nrt · 东京 (Tokyo)</option>
+        <option value="sgp">sgp · 新加坡 (Singapore)</option>
+        <option value="icn">icn · 首尔 (Seoul)</option>
+        <option value="lax">lax · 洛杉矶 (LA)</option>
+        <option value="fra">fra · 法兰克福 (Frankfurt)</option>
+      </select>
+      <select id="plan">
+        <option value="vc2-1c-0.5gb" selected>$3.5/mo · 512MB</option>
+        <option value="vc2-1c-1gb">$5/mo · 1GB</option>
+      </select>
+    </div>
+    <button class="btn btn-primary btn-full" id="createBtn" onclick="doAction('create')">创建节点</button>
+    <div style="height:8px"></div>
+    <button class="btn btn-green btn-full" id="updateBtn" onclick="doAction('update')" disabled>等待初始化…</button>
+    <div style="height:8px"></div>
+    <button class="btn btn-danger btn-full" id="destroyBtn" onclick="doAction('destroy')">销毁节点</button>
+  </div>
+
+  <div class="log-card">
+    <div class="log-header">
+      <h3>操作日志</h3>
+      <span style="font-size:12px;color:var(--muted)" id="logTime"></span>
+    </div>
+    <div class="log-body" id="logBody">[11:39:03] The fingerprint for the ED25519 key sent by the remote host is
+[11:39:03] SHA256:wXfwmk5d6XPunjyStmFSSaqyceybor/vPF7H74dqmt4.
+[11:39:03] Please contact your system administrator.
+[11:39:03] Add correct host key in /home/jun/.ssh/known_hosts to get rid of this message.
+[11:39:03] Offending ECDSA key in /home/jun/.ssh/known_hosts:23
+[11:39:03]   remove with:
+[11:39:03]   ssh-keygen -f &#x27;/home/jun/.ssh/known_hosts&#x27; -R &#x27;64.176.199.102&#x27;
+[11:39:03] Password authentication is disabled to avoid man-in-the-middle attacks.
+[11:39:03] Keyboard-interactive authentication is disabled to avoid man-in-the-middle attacks.
+[11:39:03] UpdateHostkeys is disabled because the host key is not trusted.
+[11:39:03] root@64.176.199.102: Permission denied (publickey,password).
+[11:39:03] ✗ update 失败 (exit=255)
+[11:39:11] 开始执行: update
+[11:39:11] [*] 正在从 Vultr API 同步最新节点信息...
+[11:39:12] [*] 发现实例: id=b22821e5-5935-45b9-a316-1ea19d730597 ip=64.176.199.102 region=ewr
+[11:39:12] [*] SSH 读取 VPS 上的真实 ss 密码...
+[11:39:13] @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+[11:39:13] @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+[11:39:13] @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+[11:39:13] IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+[11:39:13] Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+[11:39:13] It is also possible that a host key has just been changed.
+[11:39:13] The fingerprint for the ED25519 key sent by the remote host is
+[11:39:13] SHA256:wXfwmk5d6XPunjyStmFSSaqyceybor/vPF7H74dqmt4.
+[11:39:13] Please contact your system administrator.
+[11:39:13] Add correct host key in /home/jun/.ssh/known_hosts to get rid of this message.
+[11:39:13] Offending ECDSA key in /home/jun/.ssh/known_hosts:23
+[11:39:13]   remove with:
+[11:39:13]   ssh-keygen -f &#x27;/home/jun/.ssh/known_hosts&#x27; -R &#x27;64.176.199.102&#x27;
+[11:39:13] Password authentication is disabled to avoid man-in-the-middle attacks.
+[11:39:13] Keyboard-interactive authentication is disabled to avoid man-in-the-middle attacks.
+[11:39:13] UpdateHostkeys is disabled because the host key is not trusted.
+[11:39:15] root@64.176.199.102: Permission denied (publickey,password).
+[11:39:15] ✗ update 失败 (exit=255)
+[11:50:32] 开始执行: update
+[11:50:32] [*] 正在从 Vultr API 同步最新节点信息...
+[11:50:33] [*] 发现实例: id=b22821e5-5935-45b9-a316-1ea19d730597 ip=64.176.199.102 region=ewr
+[11:50:33] [*] SSH 读取 VPS 上的真实 ss 密码...
+[11:50:34] @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+[11:50:34] @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+[11:50:34] @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+[11:50:34] IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+[11:50:34] Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+[11:50:34] It is also possible that a host key has just been changed.
+[11:50:34] The fingerprint for the ED25519 key sent by the remote host is
+[11:50:34] SHA256:wXfwmk5d6XPunjyStmFSSaqyceybor/vPF7H74dqmt4.
+[11:50:34] Please contact your system administrator.
+[11:50:34] Add correct host key in /home/jun/.ssh/known_hosts to get rid of this message.
+[11:50:34] Offending ECDSA key in /home/jun/.ssh/known_hosts:23
+[11:50:34]   remove with:
+[11:50:34]   ssh-keygen -f &#x27;/home/jun/.ssh/known_hosts&#x27; -R &#x27;64.176.199.102&#x27;
+[11:50:34] Password authentication is disabled to avoid man-in-the-middle attacks.
+[11:50:34] Keyboard-interactive authentication is disabled to avoid man-in-the-middle attacks.
+[11:50:34] UpdateHostkeys is disabled because the host key is not trusted.
+[11:50:35] root@64.176.199.102: Permission denied (publickey,password).
+[11:50:35] ✗ update 失败 (exit=255)
+[11:51:33] 开始执行: update
+[11:51:33] [*] 正在从 Vultr API 同步最新节点信息...
+[11:51:35] [*] 发现实例: id=b22821e5-5935-45b9-a316-1ea19d730597 ip=64.176.199.102 region=ewr
+[11:51:35] [*] SSH 读取 VPS 上的真实 ss 密码...
+[11:51:36] @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+[11:51:36] @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+[11:51:36] @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+[11:51:36] IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+[11:51:36] Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+[11:51:36] It is also possible that a host key has just been changed.
+[11:51:36] The fingerprint for the ED25519 key sent by the remote host is
+[11:51:36] SHA256:wXfwmk5d6XPunjyStmFSSaqyceybor/vPF7H74dqmt4.
+[11:51:36] Please contact your system administrator.
+[11:51:36] Add correct host key in /home/jun/.ssh/known_hosts to get rid of this message.
+[11:51:36] Offending ECDSA key in /home/jun/.ssh/known_hosts:23
+[11:51:36]   remove with:
+[11:51:36]   ssh-keygen -f &#x27;/home/jun/.ssh/known_hosts&#x27; -R &#x27;64.176.199.102&#x27;
+[11:51:36] Password authentication is disabled to avoid man-in-the-middle attacks.
+[11:51:36] Keyboard-interactive authentication is disabled to avoid man-in-the-middle attacks.
+[11:51:36] UpdateHostkeys is disabled because the host key is not trusted.
+[11:51:37] root@64.176.199.102: Permission denied (publickey,password).
+[11:51:37] ✗ update 失败 (exit=255)
+[12:10:24] 开始执行: update
+[12:10:24] [*] 正在从 Vultr API 同步最新节点信息...
+[12:10:26] [*] 发现实例: id=b22821e5-5935-45b9-a316-1ea19d730597 ip=64.176.199.102 region=ewr
+[12:10:26] [*] SSH 读取 VPS 上的真实 ss 密码...
+[12:10:27] Warning: Permanently added &#x27;64.176.199.102&#x27; (ED25519) to the list of known hosts.
+[12:10:32] [*] 已更新 clash.yaml
+[12:10:32] [*] 订阅已更新: 64.176.199.102 (ewr)
+[12:10:32] ==== 订阅链接 (固定，填入 Clash / Shadowrocket 即可) ====
+[12:10:32] http://100.90.80.9:8888/sub/clash.yaml
+[12:10:32] 当前节点 IP: 64.176.199.102
+[12:10:32] Shadowsocks 密码: P5W2NVTtRGdYjUTyUJnavzr07ChNsjvM
+[12:10:32] [手动导入] ss:// 链接:
+[12:10:32] ss://YWVzLTI1Ni1nY206UDVXMk5WVHRSR2RZalVUeVVKbmF2enIwN0NoTnNqdk0=@64.176.199.102:8388#vultr-ss
+[12:10:32] ✓ update 完成
+[12:16:52] 开始执行: destroy
+[12:16:52] [*] 销毁实例: id=b22821e5-5935-45b9-a316-1ea19d730597
+[12:16:54] [*] 计费已结算，累计历史消耗: 0.0032907014083333333
+[12:16:54] [*] 已销毁，clash.yaml 已清空
+[12:16:54] ✓ destroy 完成
+[12:25:23] 开始执行: destroy
+[12:25:24] [*] 没有实例，无需销毁
+[12:25:24] ✓ destroy 完成
+</div>
+  </div>
+
+</div>
+
+<!-- API Key 弹窗 -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h3>设置 Vultr API Key</h3>
+    <input type="password" id="keyInput" placeholder="粘贴你的 Vultr API Key">
+    <div id="selfMsg" style="font-size:12px;color:var(--muted);margin:2px 0 12px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="runSelftest()">环境自检</button>
+      <button class="btn btn-primary" onclick="saveKey()">保存</button>
+      <button class="btn btn-secondary" onclick="hideModal()">取消</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let busy = false;
+let currentSub = "";
+let logPollInterval = null;
+
+function showModal() {
+  document.getElementById('modal').classList.add('show');
+  document.getElementById('keyInput').focus();
+}
+function hideModal() {
+  document.getElementById('modal').classList.remove('show');
+}
+
+async function saveKey() {
+  const key = document.getElementById('keyInput').value.trim();
+  if (!key) return;
+  const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({action:"savekey", key})});
+  const j = await r.json();
+  const box = document.getElementById('selfMsg');
+  if (box) box.textContent = j.ok ? '✓ API Key 有效并已保存' : ('✗ ' + (j.output || '校验失败'));
+  if (j.ok) {
+    setTimeout(() => { hideModal(); loadStatus(); }, 600);
+  }
+}
+
+async function runSelftest() {
+  const box = document.getElementById('selfMsg');
+  if (box) box.textContent = '自检中…';
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"selftest"})});
+    const j = await r.json();
+    const lines = ['平台: ' + (j.platform||''), '机器: ' + (j.machine||'') + ' · Python ' + (j.python||'')];
+    (j.checks||[]).forEach(c => lines.push((c.present?'✓ ':'✗ ') + c.name + (c.path?' ('+c.path+')':'') + ' — ' + (c.desc||'')));
+    if (j.tailscale_ip) lines.push('Tailscale IP: ' + j.tailscale_ip);
+    if (box) box.textContent = lines.join('\n');
+  } catch(e) {
+    if (box) box.textContent = '自检失败: ' + e.message;
+  }
+}
+
+async function loadStatus() {
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"status"})});
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.output || '状态查询失败');
+    if (j.instance) {
+      const inst = j.instance;
+      const running = inst.status === 'active' && inst.power_status === 'running';
+      const readyInit = inst.initialized === true;    // 节点初始化完成才能 Update
+      document.getElementById('nodeDot').className = running ? 'dot on' : 'dot off';
+      document.getElementById('nodeLabel').textContent = inst.region + ' · ' + inst.status;
+      document.getElementById('nodeCard').className = running ? 'node-card active' : 'node-card inactive';
+      document.getElementById('nodeName').textContent = inst.region + ' (' + inst.main_ip + ')';
+      document.getElementById('nodeStatus').className = running ? 'node-status on' : 'node-status off';
+      document.getElementById('nodeStatus').textContent = running ? (readyInit ? '运行中' : '初始化中…') : inst.status;
+      document.getElementById('niRegion').textContent = inst.region;
+      document.getElementById('niPlan').textContent = inst.plan;
+      document.getElementById('niIP').textContent = inst.main_ip;
+      document.getElementById('niPass').textContent = inst.ss_password || '-';
+      document.getElementById('niCreateTime').textContent = inst.create_duration != null ? inst.create_duration + ' 秒' : '-';
+      // 仅节点已创建且初始化完成，才允许"更新订阅"
+      document.getElementById('updateBtn').disabled = !(running && readyInit);
+      document.getElementById('updateBtn').textContent = (running && readyInit) ? '更新订阅' : '等待初始化…';
+      currentSub = j.subscription_url || '';
+      return;
+    }
+    document.getElementById('nodeDot').className = 'dot off';
+    document.getElementById('nodeLabel').textContent = '无节点';
+    document.getElementById('nodeCard').className = 'node-card inactive';
+    document.getElementById('nodeName').textContent = '无活跃节点';
+    document.getElementById('nodeStatus').className = 'node-status off';
+    document.getElementById('nodeStatus').textContent = '未激活';
+    document.getElementById('niRegion').textContent = '-';
+    document.getElementById('niPlan').textContent = '-';
+    document.getElementById('niIP').textContent = '-';
+    document.getElementById('niPass').textContent = '-';
+    document.getElementById('updateBtn').disabled = true;
+    document.getElementById('updateBtn').textContent = '更新订阅';
+    currentSub = j.subscription_url || '';
+  } catch (e) {
+    document.getElementById('nodeLabel').textContent = '状态查询失败';
+    document.getElementById('nodeName').textContent = e.message;
+  }
+}
+
+async function loadLog() {
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"getlog"})});
+    const j = await r.json();
+    const el = document.getElementById('logBody');
+    el.textContent = j.log || '准备就绪';
+    el.scrollTop = el.scrollHeight;
+  } catch(e) {}
+}
+
+async function checkBusy() {
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"isbusy"})});
+    const j = await r.json();
+    return j.busy || false;
+  } catch(e) {
+    return false;
+  }
+}
+
+function setButtons(disabled) {
+  document.getElementById('createBtn').disabled = disabled;
+  document.getElementById('updateBtn').disabled = disabled;
+  document.getElementById('destroyBtn').disabled = disabled;
+}
+
+async function doAction(action) {
+  // 先给即时反馈：确认弹窗同步弹出，不被待网络卡住
+  if (action === 'create' && !confirm('即将创建新实例，确认？')) return;
+  if (action === 'destroy' && !confirm('确认销毁实例？将停止计费')) return;
+
+  setButtons(true);
+  document.getElementById('logBody').textContent = '正在执行…';
+
+  // 检查是否已有操作在运行（仅提示，不阻塞）
+  try {
+    const isBusy = await checkBusy();
+    if (isBusy) {
+      setButtons(false);
+      loadLog();
+      return;
+    }
+  } catch(e) {}
+
+  const region = document.getElementById('region').value;
+  const plan = document.getElementById('plan').value;
+
+  let resp;
+  try {
+    resp = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action, region, plan})});
+  } catch(e) {
+    console.error(e);
+    loadLog();
+    loadStatus();
+    setButtons(false);
+    return;
+  }
+
+  // 立即刷新一次日志（服务端已写入"开始执行"）
+  loadLog();
+
+  // 若服务端未真正启动后台任务（如已有节点），立即结束
+  try {
+    const j = await resp.json();
+    if (j.started === false) {
+      loadLog();
+      loadStatus();
+      setButtons(false);
+      return;
+    }
+  } catch(e) {}
+
+  // 执行期间轮询日志；动作完成（busy=false）后结束并刷新状态
+  if (logPollInterval) clearInterval(logPollInterval);
+  logPollInterval = setInterval(async () => {
+    loadLog();
+    const stillBusy = await checkBusy();
+    if (!stillBusy) {
+      if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
+      loadLog();
+      loadStatus();
+      setButtons(false);
+    }
+  }, 2000);
+}
+
+function copySub() {
+  const url = currentSub || 'http://100.90.80.9:8888/sub/clash.yaml';
+  const showCopied = () => {
+    const hint = document.getElementById('copyHint');
+    hint.classList.add('show');
+    setTimeout(() => hint.classList.remove('show'), 1500);
+  };
+  const fallbackCopy = () => {
+    const t = document.createElement('textarea');
+    t.value = url;
+    t.style.position = 'fixed';
+    t.style.opacity = '0';
+    document.body.appendChild(t);
+    t.focus();
+    t.select();
+    t.setSelectionRange(0, t.value.length);
+    const copied = document.execCommand('copy');
+    document.body.removeChild(t);
+    if (copied) showCopied();
+  };
+
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(url).then(showCopied).catch(fallbackCopy);
+  } else {
+    fallbackCopy();
+  }
+}
+
+// 套餐↔地区联动：新泽西↔$3.5，其他地区↔$5
+function syncPlanRegion() {
+  const region = document.getElementById('region');
+  const plan = document.getElementById('plan');
+  if (region.value === 'ewr') {
+    plan.value = 'vc2-1c-0.5gb';          // 新泽西 → $3.5
+  } else {
+    plan.value = 'vc2-1c-1gb';            // 日本/其他 → $5
+  }
+  if (plan.value === 'vc2-1c-0.5gb') {
+    region.value = 'ewr';                 // $3.5 → 新泽西
+  }
+}
+document.getElementById('region').addEventListener('change', syncPlanRegion);
+document.getElementById('plan').addEventListener('change', syncPlanRegion);
+
+async function loadCost() {
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"cost"})});
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.output || '费用查询失败');
+    const b = j.billing;
+    // 余额 = -(充入金额 + 已花费)：-10 为充入，0.22 为本月已花费
+    if (b.balance != null && b.pending != null) {
+      const remaining = -1 * (b.balance + b.pending);
+      document.getElementById('coBalance').textContent =
+        '$' + remaining.toFixed(2) + (b.pending > 0 ? '（本月已花费 $' + b.pending + '）' : '');
+    } else {
+      document.getElementById('coBalance').textContent = '-';
+    }
+    document.getElementById('coCurrent').textContent =
+      (b.current_cost != null ? '$' + b.current_cost.toFixed(4) : '-') + (b.current_plan_monthly ? '（月费 $' + b.current_plan_monthly + '）' : '');
+    document.getElementById('coHistory').textContent =
+      (b.history_total != null ? '$' + b.history_total.toFixed(4) : '-') + (b.total_all != null && b.total_all > 0 ? ' · 累计 $' + b.total_all.toFixed(4) : '');
+  } catch(e) {
+    document.getElementById('coBalance').textContent = '查询失败';
+  }
+}
+
+// Enter 键保存 API Key
+document.getElementById('keyInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') saveKey();
+});
+
+// 初始加载（各页首次各请求一次，后续用户手动刷新）
+loadStatus();
+loadCost();
+loadLog();
+
+// 操作执行期间由 doAction 内部轮询日志；无操作时不再自动刷新
+</script>
+</body>
+</html>

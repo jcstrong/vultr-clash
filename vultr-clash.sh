@@ -68,6 +68,63 @@ require_curl() { command -v curl >/dev/null || die "需要 curl"; }
 # 隔离 known_hosts：避免 Vultr 复用 IP 时 host key 变更导致 SSH 拒绝连接
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no)
 
+# --- 平台兼容 (macOS / Linux) ---
+# base64: GNU 用 -w0，BSD/macOS 无该参数 → 一律管道去换行
+b64() { base64 | tr -d '\n'; }
+
+# 可移植端口探测：优先 nc，回退 python3 socket，最后 /dev/tcp
+port_open() {
+    local host="$1" port="$2"
+    if command -v nc >/dev/null 2>&1; then
+        nc -z -w2 "$host" "$port" 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(2)
+try:
+    s.connect((sys.argv[1], int(sys.argv[2])))
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+    else
+        (echo > "/dev/tcp/${host}/${port}") 2>/dev/null
+    fi
+}
+
+# 密码 SSH：sshpass 优先；缺失时回退 expect（macOS 自带的 /usr/bin/expect，免额外安装）
+# 用法: ssh_exec <ip> <password> <remote_command> [timeout_s]
+ssh_exec() {
+    local ip="$1" pw="$2" cmd="${3:-true}" timeout="${4:-10}"
+    if command -v sshpass >/dev/null 2>&1; then
+        sshpass -p "$pw" ssh "${SSH_OPTS[@]}" -o ConnectTimeout="$timeout" root@"$ip" "$cmd"
+        return $?
+    fi
+    if command -v expect >/dev/null 2>&1; then
+        SSH_HOST="$ip" SSH_PASS="$pw" SSH_CMD="$cmd" SSH_TIMEOUT="$timeout" \
+        expect <<'EXP'
+set timeout [expr {[string trim $env(SSH_TIMEOUT)] + 20}]
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+          -o ConnectTimeout=$env(SSH_TIMEOUT) root@$env(SSH_HOST) $env(SSH_CMD)
+expect {
+    -re {[Pp]assword(:| for root@)} { send -- "$env(SSH_PASS)\r"; exp_continue }
+    -re {[Pp]ermission denied}     { puts stderr "SSH 认证失败(密码错误或无权限)"; exit 1 }
+    eof
+}
+catch wait result
+if {[llength $result] >= 4} { exit [lindex $result 3] }
+exit 1
+EXP
+        return $?
+    fi
+    die "缺少 sshpass 或 expect：macOS 执行 'brew install hudochenkov/sshpass/sshpass' 安装其一"
+}
+
 gen_ss_password() {
     openssl rand -base64 32 | tr -d '/+=' | head -c 32
 }
@@ -105,7 +162,7 @@ wait_for_ssh() {
     local ip="$1"
     local tries=0
     while (( tries < 30 )); do
-        if nc -z -w2 "$ip" 22 2>/dev/null; then
+        if port_open "$ip" 22; then
             return 0
         fi
         tries=$((tries + 1))
@@ -139,6 +196,9 @@ proxy-groups:
       - DIRECT
 
 rules:
+  # mini4k: .com 国内DNS被污染(假IP)，必须走代理由节点远程解析；.net 源站异常时代理兜底
+  - DOMAIN-SUFFIX,mini4k.com,Proxy
+  - DOMAIN-SUFFIX,mini4k.net,DIRECT
   - GEOIP,CN,DIRECT
   - MATCH,Proxy
 EOF
@@ -166,7 +226,7 @@ create_instance() {
     ss_password="$(gen_ss_password)"
 
     local userdata
-    userdata="$(make_cloudinit "$ss_password" | base64 -w0)"
+    userdata="$(make_cloudinit "$ss_password" | b64)"
 
     log "正在创建实例: region=$region plan=$plan"
     local payload
@@ -220,28 +280,27 @@ create_instance() {
         log "等待 shadowsocks 端口(8388)开放..."
         local sstries=0
         while (( sstries < 30 )); do
-            if nc -z -w2 "$ip" "$SS_PORT" 2>/dev/null; then
+            if port_open "$ip" "$SS_PORT"; then
                 break
             fi
             sstries=$((sstries + 1))
             sleep 5
         done
 
-        if nc -z -w2 "$ip" "$SS_PORT" 2>/dev/null; then
+        if port_open "$ip" "$SS_PORT"; then
             log "shadowsocks 端口已开放"
         else
             log "shadowsocks 端口未开放，尝试 SSH 远程修复（放行防火墙/重启服务）..."
             local fixed=0
-            if sshpass -p "$root_pw" ssh "${SSH_OPTS[@]}" -o ConnectTimeout=10 \
-                    root@"$ip" '
+            if ssh_exec "$ip" "$root_pw" '
                 ufw allow 8388/tcp >/dev/null 2>&1 || true
                 ufw allow 8388/udp >/dev/null 2>&1 || true
                 systemctl restart shadowsocks-libev >/dev/null 2>&1 || \
                     ss-server -c /etc/shadowsocks-libev/config.json -f /tmp/ss.pid >/dev/null 2>&1 || true
-            '; then
+            ' 10; then
                 local stries=0
                 while (( stries < 12 )); do
-                    if nc -z -w2 "$ip" "$SS_PORT" 2>/dev/null; then
+                    if port_open "$ip" "$SS_PORT"; then
                         fixed=1
                         break
                     fi
@@ -257,8 +316,7 @@ create_instance() {
         fi
 
         # 标记初始化完成（SSH + 8388 均就绪才置 true，供前端控制"更新订阅"按钮）
-        if sshpass -p "$root_pw" ssh "${SSH_OPTS[@]}" -o ConnectTimeout=10 \
-                root@"$ip" 'true' 2>/dev/null && nc -z -w2 "$ip" "$SS_PORT" 2>/dev/null; then
+        if ssh_exec "$ip" "$root_pw" 'true' 10 >/dev/null 2>&1 && port_open "$ip" "$SS_PORT"; then
             set_initialized 1
             log "节点初始化完成"
         else
@@ -306,7 +364,15 @@ destroy_instance() {
 }
 
 get_subscription_url() {
-    printf '%s' "$SUB_URL"
+    local url="$SUB_URL" token=""
+    # 若已启用订阅 token 鉴权，则自动把订阅路径升级为带 token 的路径
+    if [[ -f "$STATE_DIR/sub_token" ]]; then
+        token="$(tr -d '[:space:]' < "$STATE_DIR/sub_token")"
+    fi
+    if [[ -n "$token" && "$url" == */sub/clash.yaml ]]; then
+        url="${url%/sub/clash.yaml}/sub/${token}/clash.yaml"
+    fi
+    printf '%s' "$url"
 }
 
 # 标记节点是否初始化完成（SSH + 8388 就绪）。1=完成 0=未完成
@@ -355,10 +421,8 @@ sync_and_update() {
     if [[ -n "$password" ]]; then
         log "SSH 读取 VPS 上的真实 ss 密码..."
         # 顺便放行防火墙并确保 ss 服务运行（幂等，处理 UFW 只放行22的问题）
-        sshpass -p "$password" ssh "${SSH_OPTS[@]}" -o ConnectTimeout=8 root@"$ip" \
-            "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; systemctl is-active shadowsocks-libev >/dev/null 2>&1 || systemctl restart shadowsocks-libev >/dev/null 2>&1; true"
-        ss_pw="$(sshpass -p "$password" ssh "${SSH_OPTS[@]}" -o ConnectTimeout=8 root@"$ip" \
-            "cat /etc/shadowsocks-libev/config.json | jq -r '.password'" 2>/dev/null || true)"
+        ssh_exec "$ip" "$password" "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; systemctl is-active shadowsocks-libev >/dev/null 2>&1 || systemctl restart shadowsocks-libev >/dev/null 2>&1; true" 8
+        ss_pw="$(ssh_exec "$ip" "$password" "cat /etc/shadowsocks-libev/config.json | jq -r '.password'" 8 2>/dev/null || true)"
     fi
 
     # 如果 SSH 拿不到，则用本地保存的密码（创建时保存）
@@ -376,8 +440,7 @@ sync_and_update() {
         local password
         password="$(jq -r '.instance.default_password // empty' "$INSTANCE_FILE" 2>/dev/null || true)"
         if [[ -n "$password" ]]; then
-            sshpass -p "$password" ssh "${SSH_OPTS[@]}" -o ConnectTimeout=8 root@"$ip" \
-                "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; sed -i 's/\"password\":.*/\"password\": \"$ss_pw\",/' /etc/shadowsocks-libev/config.json && systemctl restart shadowsocks-libev" 2>/dev/null || true
+            ssh_exec "$ip" "$password" "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; sed -i 's/\"password\":.*/\"password\": \"$ss_pw\",/' /etc/shadowsocks-libev/config.json && systemctl restart shadowsocks-libev" 8 2>/dev/null || true
         fi
     fi
 
@@ -423,7 +486,7 @@ connect() {
         ip="$(jq -r '.instance.main_ip // empty' "$INSTANCE_FILE")"
         pw="$(jq -r '.instance.ss_password // empty' "$INSTANCE_FILE")"
         [[ -n "$ip" && -n "$pw" ]] && printf 'ss://%s@%s:%d#vultr-ss\n' \
-            "$(printf "aes-256-gcm:%s" "$pw" | base64 -w0)" "$ip" "$SS_PORT"
+            "$(printf "aes-256-gcm:%s" "$pw" | b64)" "$ip" "$SS_PORT"
     fi
     printf '\n'
 }
@@ -435,5 +498,6 @@ case "${1:-}" in
     export)     connect ;;
     status)     connect ;;
     update)     sync_and_update ;;
-    *)          echo "用法: $0 {create|destroy|connect|export|status|update}"; exit 1 ;;
+    guard)      exec bash "$BASE_DIR/node-guard.sh" "${2:-run}" ;;
+    *)          echo "用法: $0 {create|destroy|connect|export|status|update|guard}"; exit 1 ;;
 esac

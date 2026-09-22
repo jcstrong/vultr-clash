@@ -15,3 +15,4 @@ clash.yaml
 node_modules/
 package-lock.json
 *.bak
+*.bak-*

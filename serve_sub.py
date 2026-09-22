@@ -29,8 +29,14 @@ def read_token():
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
+    # 强制 HTTP/1.1，避免 Go HTTP 客户端在 HTTP/1.0 + keep-alive 上的 EOF 行为
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        # 写到 stderr 便于 systemd journal + 自定义日志双采
+        import sys
+        sys.stderr.write("[serve_sub] %s - %s\n" % (self.address_string(), format % args))
+        sys.stderr.flush()
 
     def do_GET(self):
         route = self.path.split("?", 1)[0].lstrip("/")
@@ -63,14 +69,24 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.exists(CLASH_YAML):
             self._err(404, b"no active node, create one first")
             return
+        try:
+            with open(CLASH_YAML, "rb") as f:
+                body = f.read()
+        except OSError as e:
+            self._err(404, f"read error: {e}\n".encode())
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/yaml; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Profile-Update-Interval", UPDATE_INTERVAL)
         self.send_header("Profile-Title", TITLE)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        with open(CLASH_YAML, "rb") as f:
-            self.wfile.write(f.read())
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _err(self, code, body=b""):
         self.send_response(code)

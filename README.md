@@ -18,6 +18,7 @@ Vultr Shadowsocks 节点管理 + Clash 订阅的一体化工具（跨平台：Li
 - **IP 复用安全**：SSH 使用隔离 known_hosts，Vultr 复用 IP 也不报 host key 冲突
 - **定时任务**：每天自动销毁/创建节点（如凌晨 00:30 销毁止损），结果通过 Bark 推送到手机；管理页展示当前计划
 - **被封自动换区重建**：守卫销毁被封节点后自动在对侧配置重建（新泽西 $3.5 ↔ 日本 $5），订阅随之切换，每日限次防循环，全程 Bark 通知
+- **MCP 服务器**：`mcp_server.py` 把管理能力暴露为 MCP 工具，AI 助手（Claude/OpenClaw 等）可直接查状态/建节点/销毁/看日志
 
 ## 架构
 
@@ -136,6 +137,54 @@ bash vultr-clash.sh guard run          # 手动跑一轮
 - 触发时有任务在执行 → 同一分钟内自动重试（20s × 3 次）
 - Vultr API 不可达 → 不误标记当天，等待下轮重试
 - 管理页「⏰ 定时任务」卡片实时展示当前计划与 Bark 配置状态
+
+## MCP 接入（AI 助手管理节点）
+
+`mcp_server.py` 是零依赖的 MCP 服务器（stdio，纯标准库），把 WebUI 的全部管理能力暴露为 10 个工具：
+
+`node_status` / `node_create` / `node_destroy` / `subscription_update` / `get_logs` / `is_busy` / `get_cost` / `get_schedule` / `rotate_subscription_token` / `selftest`
+
+所有工具转发到 WebUI `/api`（复用其并发锁/日志/计费），不直接接触 Vultr 凭据。默认连本机 `http://127.0.0.1:8333/api`，用环境变量 `VULTR_WEBUI_URL` 覆盖。
+
+客户端配置示例：
+
+```jsonc
+// 服务器本机（或 SSH 远程执行）
+{
+  "mcpServers": {
+    "vultr-clash": {
+      "command": "python3",
+      "args": ["/home/jun/vultr-clash/mcp_server.py"]
+    }
+  }
+}
+
+// 其他机器（不经 SSH，直连 Tailscale 地址）
+{
+  "mcpServers": {
+    "vultr-clash": {
+      "command": "python3",
+      "args": ["/本地路径/mcp_server.py"],
+      "env": { "VULTR_WEBUI_URL": "http://100.90.80.9:8333/api" }
+    }
+  }
+}
+
+// 经 SSH 在服务器上运行（本地无需代码）
+{
+  "mcpServers": {
+    "vultr-clash": {
+      "command": "ssh",
+      "args": ["jun@100.90.80.9", "python3", "/home/jun/vultr-clash/mcp_server.py"]
+    }
+  }
+}
+```
+
+说明：
+
+- `node_create` / `node_destroy` / `subscription_update` 是后台异步任务，工具默认轮询等它完成再返回（`wait:false` 可立即返回，用 `get_logs` 查进度）
+- 管理 `/api` 无鉴权（内网服务），请用 Tailscale ACL / 防火墙限制访问面
 
 ## Tailscale 分发
 

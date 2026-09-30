@@ -94,7 +94,13 @@ def bark_notify(title, body):
     if not url:
         append_log("⚠ 未配置 bark_url（.state/schedule.json），跳过 Bark 通知")
         return False
-    payload = json.dumps({"title": title, "body": body, "group": "vultr-clash"})
+    # 夜间免打扰 00:30-07:30：passive 静默投递（不响铃不亮屏，仍进通知中心）
+    import time as _time
+    _m = _time.localtime()
+    payload = {"title": title, "body": body, "group": "vultr-clash"}
+    if 30 <= _m.tm_hour * 60 + _m.tm_min < 450:
+        payload["level"] = "passive"
+    payload = json.dumps(payload)
     try:
         r = subprocess.run(
             ["curl", "-4", "-sS", "--fail-with-body", "--max-time", "10",

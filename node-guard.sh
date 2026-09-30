@@ -41,7 +41,13 @@ bark_push() {
     local title="$1" body="$2" url
     url="$(jq -r '.bark_url // empty' "$SCHEDULE_FILE" 2>/dev/null || true)"
     [[ -n "$url" ]] || return 0
-    if jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b, group:"vultr-clash"}' \
+    local payload='{title:$t, body:$b, group:"vultr-clash"}' _hm
+    _hm="$(date +%H%M)"
+    # 夜间免打扰 00:30-07:30：passive 静默投递（不响铃不亮屏）；定宽字符串比较，无八进制坑
+    if [[ "$_hm" > "0029" && "$_hm" < "0730" ]]; then
+        payload='{title:$t, body:$b, group:"vultr-clash", level:"passive"}'
+    fi
+    if jq -n --arg t "$title" --arg b "$body" "$payload" \
         | curl -4 -sS --fail-with-body -m 10 -X POST -H "Content-Type: application/json" -d @- "$url" >/dev/null 2>&1; then
         append_state_log "✓ Bark 通知已发送: $title"
     else

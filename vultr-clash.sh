@@ -199,6 +199,8 @@ rules:
   # mini4k: .com 国内DNS被污染(假IP)，必须走代理由节点远程解析；.net 源站异常时代理兜底
   - DOMAIN-SUFFIX,mini4k.com,Proxy
   - DOMAIN-SUFFIX,mini4k.net,DIRECT
+  # github.com: DNS污染假IP命中GEOIP,CN被直连→TLS重置，强制走Proxy (2026-10-06)
+  - DOMAIN-SUFFIX,github.com,Proxy
   - GEOIP,CN,DIRECT
   - MATCH,Proxy
 EOF
@@ -221,6 +223,10 @@ create_instance() {
             return
         fi
     fi
+
+    # 创建进行中标记：guard 见到即跳过本轮探测，避免误杀在建节点（trap 兜底清理）
+    touch "$STATE_DIR/creating"
+    trap 'rm -f "$STATE_DIR/creating"' EXIT
 
     local ss_password
     ss_password="$(gen_ss_password)"
@@ -311,22 +317,36 @@ create_instance() {
             if (( fixed == 1 )); then
                 log "远程修复成功，shadowsocks 端口已开放"
             else
-                log "⚠ 远端 8388 仍不可达，但节点已创建成功，现场已保存（可稍后 SSH 检查）"
+                log "⚠ 远端 8388 仍不可达，节点不可用，立即注销止损..."
+                destroy_instance
+                die "shadowsocks 端口未开放，实例已注销"
             fi
         fi
 
         # 标记初始化完成（SSH + 8388 均就绪才置 true，供前端控制"更新订阅"按钮）
-        if ssh_exec "$ip" "$root_pw" 'true' 10 >/dev/null 2>&1 && port_open "$ip" "$SS_PORT"; then
+        local init_ok=0 init_try
+        for init_try in 1 2; do
+            if ssh_exec "$ip" "$root_pw" 'true' 10 >/dev/null 2>&1 && port_open "$ip" "$SS_PORT"; then
+                init_ok=1
+                break
+            fi
+            if (( init_try == 1 )); then sleep 10; fi
+        done
+        if (( init_ok == 1 )); then
             set_initialized 1
             log "节点初始化完成"
         else
-            set_initialized 0
-            log "⚠ 节点尚未完全就绪（Update 将在就绪后启用）"
+            log "⚠ 节点未完全就绪，立即注销止损..."
+            destroy_instance
+            die "节点初始化未完成，实例已注销"
         fi
 
         connect
     else
-        die "SSH 等待超时"
+        # SSH 一直不通 = 该 IP 不可用（出生即被墙/异常）：立即注销止损，不留僵尸实例
+        log "SSH 等待超时，节点不可用，立即注销止损..."
+        destroy_instance
+        die "SSH 等待超时，实例已注销"
     fi
 }
 

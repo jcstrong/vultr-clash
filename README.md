@@ -15,6 +15,7 @@ Vultr Shadowsocks 节点管理 + Clash 订阅的一体化工具（跨平台：Li
 - **订阅服务**：HTTP 提供 `clash.yaml`，Tailscale 内网 / 公网均可访问；可选 token 鉴权（`/sub/{token}/clash.yaml`，轮换后旧链接立即失效）
 - **MAC 支持**：管理端可在 macOS 运行（`install.sh` 自动用 launchd；密码 SSH 缺 sshpass 时回退系统自带 expect；`nc` 探活回退 python3）
 - **自愈**：自动放行 VPS 防火墙 8388、重启 shadowsocks、从 VPS 读取真实密码（避免密码漂移）
+- **止损**：create 失败（SSH 超时 / SS 端口起不来 / 初始化未完成）立即注销实例，不留僵尸计费；guard 对从未就绪的节点跳过 2 轮防抖，并用 .state/creating 标记避开在建节点
 - **IP 复用安全**：SSH 使用隔离 known_hosts，Vultr 复用 IP 也不报 host key 冲突
 - **定时任务**：每天自动销毁/创建节点（如凌晨 00:30 销毁止损），结果通过 Bark 推送到手机；管理页展示当前计划
 - **被封自动换区重建**：守卫销毁被封节点后自动在对侧配置重建（新泽西 $3.5 ↔ 日本 $5），订阅随之切换，每日限次防循环，全程 Bark 通知

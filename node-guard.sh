@@ -145,6 +145,14 @@ run_once() {
         return 0
     fi
 
+    # 1.5 创建进行中（标记 15 分钟内有效）→ 跳过本轮探测，避免误杀在建节点
+    local marker="$STATE_DIR/creating"
+    if [[ -f "$marker" ]] && [[ -z "$(find "$marker" -mmin +15 2>/dev/null)" ]]; then
+        echo "guard: 创建进行中，跳过"
+        return 0
+    fi
+    rm -f "$marker" 2>/dev/null || true
+
     # 2. API 自身不可达 → 跳过，不累计、不误杀
     local inst
     inst="$(vultr_instance)"
@@ -179,11 +187,18 @@ run_once() {
     fi
 
     # 4. 累计失败
-    local fails
+    local fails initialized
+    initialized="$(jq -r '.instance.initialized // 0' "$INSTANCE_FILE" 2>/dev/null || echo 0)"
     fails="$(read_fail_count)"
     fails=$((fails + 1))
     write_fail_count "$fails"
-    append_state_log "节点 $ip 不可达 (SS/SSH 均超时)，失败计数 $fails/$GUARD_FAILS"
+    append_state_log "节点 $ip 不可达 (SS/SSH 均超时)，失败计数 $fails/$GUARD_FAILS (initialized=$initialized)"
+
+    # 从未初始化成功的节点（create 中途死掉的僵尸）无需 2 轮防抖，立即按不可用处理
+    if (( initialized != 1 )) && (( fails < GUARD_FAILS )); then
+        append_state_log "节点从未就绪，跳过防抖立即处理"
+        fails=$GUARD_FAILS
+    fi
 
     if (( fails >= GUARD_FAILS )); then
         local plan region

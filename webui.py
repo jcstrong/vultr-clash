@@ -1091,6 +1091,9 @@ loadSchedule();
 </body>
 </html>"""
 
+# 记入 progress.log 的"用户主动操作"白名单；轮询类(isbusy/getlog/status等)不记避免刷屏
+CLICK_ACTIONS = {"create", "destroy", "update", "selftest", "rotatetoken", "savekey"}
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -1130,6 +1133,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             data = {}
         action = data.get("action", "")
+
+        # 按钮点击审计：谁在什么时候点了什么按钮（含参数与来源 IP），便于排查与总结
+        if action in CLICK_ACTIONS:
+            client_ip = self.client_address[0] if self.client_address else "?"
+            extras = []
+            if data.get("region"):
+                extras.append(f"region={data['region']}")
+            if data.get("plan"):
+                extras.append(f"plan={data['plan']}")
+            if data.get("key"):
+                extras.append("key=***")
+            suffix = (" " + " ".join(extras)) if extras else ""
+            append_log(f"🖱 [ui] {action}{suffix} ← {client_ip}")
         
         if action == "savekey":
             key = (data.get("key") or "").strip()

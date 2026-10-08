@@ -218,6 +218,22 @@ VULTR_API_KEY=xxx bash vultr-clash.sh destroy                  # 销毁(自动�
 VULTR_API_KEY=xxx bash vultr-clash.sh connect                  # 打印订阅链接/ss:// 链接
 ```
 
+## create 失败自动重试与 SSH 等待时长调优（v0.5.0）
+
+- `create` 内置"立刻销毁 → 换区域 → 重试"：任何失败（SSH 等待超时、8388 未开放、初始化未完成、API 报错）都会先销毁当前实例（幂等兜底，防计费残留），再按区域环自动换节点重试。首次尝试用你点击的区域/套餐，后续按 operator 策略（ewr=$3.5，其余 $5）。
+- SSH 等待由 ~300 秒缩至 ~150 秒（实测健康节点 IP 分配后 60-71 秒 SSH 就绪）。
+- WebUI 详细记录用户主动点击的按钮（动作、参数、来源 IP），日志前缀 `🖱 [ui]`，轮询类请求不记录。
+
+可调键（写入 `.state/schedule.json` 热生效，无需重启）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `ssh_wait_tries` | `15` | SSH 端口探测次数（每轮 ~10 秒，15 次 ≈ 150 秒） |
+| `create_retry_regions` | `ewr,nrt,lax,sjc,sea,icn` | 区域重试环，从点击的区域开始依序轮 |
+| `create_max_attempts` | `5` | 最大尝试次数（含首次） |
+
+环境变量兜底：`VULTR_SSH_WAIT_TRIES`、`VULTR_RETRY_REGIONS`、`VULTR_CREATE_MAX_ATTEMPTS`。
+
 ## 免责声明
 
 本项目仅用于学习与合法用途。请遵守当地法律法规及 Vultr 服务条款，勿用于任何非法访问。

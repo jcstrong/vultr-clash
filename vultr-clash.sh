@@ -158,10 +158,22 @@ make_cloudinit() {
     printf '%s' "$result"
 }
 
+# SSH 等待时长：健康节点 IP→SSH 就绪实测 60-71 秒（2026-10 统计 8 例），
+# 默认 15 次 × ~10s ≈ 150 秒（原 30 次 ≈ 300 秒，砍半仍留 2 倍裕量）。
+# 覆盖优先级：.state/schedule.json 的 ssh_wait_tries（热生效）> 环境变量 VULTR_SSH_WAIT_TRIES > 默认 15
+ssh_wait_tries() {
+    local v
+    v="$(jq -r '.ssh_wait_tries // empty' "$STATE_DIR/schedule.json" 2>/dev/null || true)"
+    [[ "$v" =~ ^[0-9]+$ ]] || v="${VULTR_SSH_WAIT_TRIES:-}"
+    [[ "$v" =~ ^[0-9]+$ ]] || v=15
+    printf '%s' "$v"
+}
+
 wait_for_ssh() {
     local ip="$1"
-    local tries=0
-    while (( tries < 30 )); do
+    local tries=0 max
+    max="$(ssh_wait_tries)"
+    while (( tries < max )); do
         if port_open "$ip" 22; then
             return 0
         fi
@@ -169,6 +181,91 @@ wait_for_ssh() {
         sleep 8
     done
     return 1
+}
+
+# ---- create 失败自动重试：立刻销毁 → 换区域 → 重试 create ----
+# 区域环默认 ewr nrt lax sjc sea icn；覆盖：schedule.json 的 create_retry_regions（逗号或空格分隔）
+# 最大尝试次数默认 5；覆盖：schedule.json 的 create_max_attempts 或环境变量 VULTR_CREATE_MAX_ATTEMPTS
+# 换区域后的套餐按 operator 策略：ewr=$3.5(vc2-1c-0.5gb)，其余 $5(vc2-1c-1gb)
+retry_regions_cfg() {
+    local v
+    v="$(jq -r '.create_retry_regions // empty' "$STATE_DIR/schedule.json" 2>/dev/null || true \
+        | tr ',' ' ' | tr -d '"')"
+    v="$(printf '%s' "$v" | xargs)"
+    printf '%s' "${v:-${VULTR_RETRY_REGIONS:-ewr nrt lax sjc sea icn}}"
+}
+
+max_attempts_cfg() {
+    local v
+    v="$(jq -r '.create_max_attempts // empty' "$STATE_DIR/schedule.json" 2>/dev/null || true)"
+    [[ "$v" =~ ^[0-9]+$ ]] || v="${VULTR_CREATE_MAX_ATTEMPTS:-}"
+    [[ "$v" =~ ^[0-9]+$ ]] || v=5
+    printf '%s' "$v"
+}
+
+plan_for_region() {
+    case "$1" in
+        ewr) printf 'vc2-1c-0.5gb' ;;
+        *)   printf 'vc2-1c-1gb' ;;
+    esac
+}
+
+# 以 start 为起点的区域环序列（去重、截断到 max 个）
+region_sequence() {
+    local start="$1" max="$2" list="$3"
+    local seq="" r found=0 out="" n=0
+    for r in $list; do
+        [[ "$r" == "$start" ]] && { found=1; continue; }
+        (( found )) && seq="$seq $r"
+    done
+    for r in $list; do
+        [[ "$r" == "$start" ]] && break
+        seq="$seq $r"
+    done
+    for r in $start $seq; do
+        (( n >= max )) && break
+        out="$out $r"; n=$((n + 1))
+    done
+    printf '%s' "${out# }"
+}
+
+action_create() {
+    local first_region="${1:-$VULTR_REGION}"
+    local first_plan="${2:-$VULTR_PLAN}"
+    local list max seq region plan n=0 ok=0 tried_all=""
+
+    list="$(retry_regions_cfg)"
+    max="$(max_attempts_cfg)"
+    seq="$(region_sequence "$first_region" "$max" "$list")"
+
+    # 创建进行中标记：guard 见到即跳过本轮探测，避免误杀在建节点。
+    # 必须覆盖整条重试链（trap 兜底清理），不能只标记单次尝试。
+    touch "$STATE_DIR/creating"
+    trap 'rm -f "$STATE_DIR/creating"' EXIT
+
+    for region in $seq; do
+        n=$((n + 1))
+        tried_all="$tried_all $region"
+        if (( n == 1 )); then
+            plan="$first_plan"
+        else
+            plan="$(plan_for_region "$region")"
+        fi
+        log "▶ 第 ${n} 次尝试: region=$region plan=$plan"
+        if ( create_attempt "$region" "$plan" ); then
+            ok=1
+            break
+        fi
+        # 幂等兜底销毁：失败路径大多已自毁，此处防 API 报错路径留下计费残留
+        [[ -n "$VULTR_API_KEY" ]] && { destroy_instance || true; }
+    done
+
+    if (( ok )); then
+        log "✓ 命中可用节点: region=$region（第 ${n} 次尝试）"
+    else
+        log "✗ create 失败：已尝试区域[${tried_all# }] 共 ${n} 次"
+        exit 1
+    fi
 }
 
 update_clash_yaml() {
@@ -207,7 +304,9 @@ EOF
     log "已更新 clash.yaml"
 }
 
-create_instance() {
+# 单次创建尝试；由 action_create 在子 shell 中调用，
+# 失败路径（die）只终止本次尝试，交由上层换区域重试
+create_attempt() {
     check_api_key
     require_curl; require_jq
 
@@ -223,10 +322,6 @@ create_instance() {
             return
         fi
     fi
-
-    # 创建进行中标记：guard 见到即跳过本轮探测，避免误杀在建节点（trap 兜底清理）
-    touch "$STATE_DIR/creating"
-    trap 'rm -f "$STATE_DIR/creating"' EXIT
 
     local ss_password
     ss_password="$(gen_ss_password)"
@@ -245,7 +340,9 @@ create_instance() {
         '{region:$region, plan:$plan, os_id:$os_id, label:$label, user_data:$userdata}')"
 
     local resp
-    resp="$(vultr_api POST /v2/instances "$payload")"
+    # 注意：本函数在 if 条件的子 shell 中运行，set -e 被抑制，
+    # vultr_api 在 $( ) 内 die 只终止替换 shell —— 必须显式 || die 快速失败
+    resp="$(vultr_api POST /v2/instances "$payload")" || die "创建实例 API 调用失败"
     printf '%s\n' "$resp" > "$INSTANCE_FILE"
     chmod 600 "$INSTANCE_FILE"
     printf '%s\n' "$resp" > "$STATE_DIR/create-response.json"
@@ -264,7 +361,7 @@ create_instance() {
         ip="$(echo "$resp" | jq -r '.instance.main_ip // empty')"
         [[ -n "$ip" && "$ip" != "0.0.0.0" ]] && break
         sleep 5
-        resp="$(vultr_api GET "/v2/instances/${id}")"
+        resp="$(vultr_api GET "/v2/instances/${id}")" || die "查询实例 API 调用失败"
         ip="$(echo "$resp" | jq -r '.instance.main_ip // empty')"
         tries=$((tries + 1))
     done
@@ -512,7 +609,7 @@ connect() {
 }
 
 case "${1:-}" in
-    create)     create_instance "${2:-}" "${3:-}" ;;
+    create)     action_create "${2:-}" "${3:-}" ;;
     destroy)    destroy_instance ;;
     connect)    connect ;;
     export)     connect ;;

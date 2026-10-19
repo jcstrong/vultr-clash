@@ -159,7 +159,8 @@ make_cloudinit() {
 }
 
 # SSH 等待时长：健康节点 IP→SSH 就绪实测 60-71 秒（2026-10 统计 8 例），
-# 默认 15 次 × ~10s ≈ 150 秒（原 30 次 ≈ 300 秒，砍半仍留 2 倍裕量）。
+# SSH 等待时长（2026-10-19 全量统计：24 例成功，23 例落 59-71s，P100=89s；失败全部打满上限）
+# 默认 15 次 × (2s 探测 + 5s 间隔) ≈ 100s：覆盖 P100 留 ~12% 余量；失败止损 150s → ~100s
 # 覆盖优先级：.state/schedule.json 的 ssh_wait_tries（热生效）> 环境变量 VULTR_SSH_WAIT_TRIES > 默认 15
 ssh_wait_tries() {
     local v
@@ -171,14 +172,15 @@ ssh_wait_tries() {
 
 wait_for_ssh() {
     local ip="$1"
-    local tries=0 max
+    local tries=0 max interval
     max="$(ssh_wait_tries)"
+    interval="${VULTR_SSH_WAIT_INTERVAL:-5}"
     while (( tries < max )); do
         if port_open "$ip" 22; then
             return 0
         fi
         tries=$((tries + 1))
-        sleep 8
+        (( tries < max )) && sleep "$interval"
     done
     return 1
 }

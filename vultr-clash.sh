@@ -212,6 +212,11 @@ plan_for_region() {
     esac
 }
 
+# 上次成功创建的地区（.state/last_success.json，create 成功时写入）；无记录时输出空
+last_success_region() {
+    jq -r '.region // empty' "$STATE_DIR/last_success.json" 2>/dev/null || true
+}
+
 # 以 start 为起点的区域环序列（去重、截断到 max 个）
 region_sequence() {
     local start="$1" max="$2" list="$3"
@@ -232,8 +237,20 @@ region_sequence() {
 }
 
 action_create() {
-    local first_region="${1:-$VULTR_REGION}"
-    local first_plan="${2:-$VULTR_PLAN}"
+    # 未显式指定地区时：优先尝试上次成功的地区（2026-10-23），无记录再回落 $VULTR_REGION
+    local first_region first_plan
+    if [[ -n "${1:-}" ]]; then
+        first_region="$1"
+        first_plan="${2:-$VULTR_PLAN}"
+    else
+        first_region="$(last_success_region)"
+        if [[ -n "$first_region" ]]; then
+            log "ℹ 未指定地区，优先尝试上次成功地区: $first_region"
+        else
+            first_region="$VULTR_REGION"
+        fi
+        first_plan="${2:-$(plan_for_region "$first_region")}"
+    fi
     local list max seq region plan n=0 ok=0 tried_all=""
 
     list="$(retry_regions_cfg)"
@@ -434,6 +451,11 @@ create_attempt() {
         if (( init_ok == 1 )); then
             set_initialized 1
             log "节点初始化完成"
+            # 记录上次成功节点：webui 展示（名称/花费/时间）+ 下次创建默认优先该地区 (2026-10-23)
+            jq -n --arg id "$id" --arg region "$region" --arg plan "$plan" --arg ip "$ip" \
+                --arg label "$INSTANCE_LABEL" --argjson now "$(date +%s)" \
+                '{id:$id, region:$region, plan:$plan, ip:$ip, label:$label, succeeded_at:$now}' \
+                > "$STATE_DIR/last_success.json" 2>/dev/null || true
         else
             log "⚠ 节点未完全就绪，立即注销止损..."
             destroy_instance

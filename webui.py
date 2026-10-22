@@ -19,6 +19,7 @@ LOG_FILE = os.path.join(BASE_DIR, ".state", "progress.log")
 LOCK_FILE = os.path.join(BASE_DIR, ".state", "action.lock")
 TIME_FILE = os.path.join(BASE_DIR, ".state", "create-duration.txt")
 BILL_FILE = os.path.join(BASE_DIR, ".state", "billing.json")
+LAST_SUCCESS_FILE = os.path.join(BASE_DIR, ".state", "last_success.json")
 SUB_URL = os.environ.get("SUB_URL", "http://localhost:8888/sub/clash.yaml")
 STATE_DIR = os.path.join(BASE_DIR, ".state")
 TOKEN_FILE = os.path.join(STATE_DIR, "sub_token")
@@ -178,6 +179,38 @@ def get_vultr_instances():
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Vultr API 请求失败")
     return json.loads(result.stdout).get("instances", [])
+
+def get_last_success():
+    """上次成功创建的节点：last_success.json + billing.json 的花费/使用时长"""
+    if not os.path.exists(LAST_SUCCESS_FILE):
+        return None
+    try:
+        with open(LAST_SUCCESS_FILE, encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not info.get("region"):
+        return None
+    info["active"] = False
+    info["cost"] = None
+    info["duration_sec"] = None
+    if os.path.exists(BILL_FILE):
+        try:
+            with open(BILL_FILE, encoding="utf-8") as f:
+                bill = json.load(f)
+            for n in bill.get("nodes", []):
+                if n.get("id") == info.get("id") and n.get("started"):
+                    hourly = 3.5 / 720 if n.get("plan") == "vc2-1c-0.5gb" else 5.0 / 720
+                    end = time.time() if n.get("active") else (n.get("ended") or time.time())
+                    if n.get("active"):
+                        info["active"] = True
+                    dur = max(0.0, end - float(n["started"]))
+                    info["duration_sec"] = int(dur)
+                    info["cost"] = round(dur / 3600.0 * hourly, 4)
+                    break
+        except (OSError, ValueError):
+            pass
+    return info
 
 def get_billing():
     """返回余额、当前节点费用、历史节点消耗"""
@@ -781,6 +814,8 @@ select:focus{outline:none;border-color:var(--accent)}
       <dt>余额</dt><dd id="coBalance">__COST_BALANCE__</dd>
       <dt>当前节点费用</dt><dd id="coCurrent">__COST_CURRENT__</dd>
       <dt>历史节点消耗</dt><dd id="coHistory">__COST_HISTORY__</dd>
+      <dt>上次成功节点</dt><dd id="coLastNode">加载中…</dd>
+      <dt>上次节点花费</dt><dd id="coLastCost">-</dd>
     </dl>
   </div>
 
@@ -1030,7 +1065,7 @@ function syncPlanRegion() {
     region.value = 'ewr';                 // $3.5 → 新泽西
   }
 }
-document.getElementById('region').addEventListener('change', syncPlanRegion);
+document.getElementById('region').addEventListener('change', () => { regionTouched = true; syncPlanRegion(); });
 document.getElementById('plan').addEventListener('change', syncPlanRegion);
 
 async function loadCost() {
@@ -1052,8 +1087,39 @@ async function loadCost() {
       (b.current_cost != null ? '$' + b.current_cost.toFixed(4) : '-') + (b.current_plan_monthly ? '（月费 $' + b.current_plan_monthly + '）' : '');
     document.getElementById('coHistory').textContent =
       (b.history_total != null ? '$' + b.history_total.toFixed(4) : '-') + (b.total_all != null && b.total_all > 0 ? ' · 累计 $' + b.total_all.toFixed(4) : '');
+    renderLastSuccess(j.last_success);
   } catch(e) {
     document.getElementById('coBalance').textContent = '查询失败';
+  }
+}
+
+// 上次成功节点：费用卡片展示 + 未手动改选时地区下拉默认选中它（创建优先上次成功地区）
+let regionTouched = false;
+function fmtDur(sec) {
+  if (sec == null) return '-';
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  return h > 0 ? h + '小时' + m + '分' : m + '分钟';
+}
+function fmtTime(epoch) {
+  if (!epoch) return '-';
+  const d = new Date(epoch * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return (d.getMonth()+1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function renderLastSuccess(ls) {
+  const nameEl = document.getElementById('coLastNode'), costEl = document.getElementById('coLastCost');
+  if (!ls) { nameEl.textContent = '暂无记录'; costEl.textContent = '-'; return; }
+  nameEl.textContent =
+    (ls.region || '-') + ' · ' + (ls.plan || '-') + (ls.ip ? ' · ' + ls.ip : '') + (ls.active ? '（当前运行中）' : '');
+  costEl.textContent =
+    (ls.cost != null ? '$' + ls.cost.toFixed(4) : '-') +
+    ' · 时长 ' + fmtDur(ls.duration_sec) + ' · 成功于 ' + fmtTime(ls.succeeded_at);
+  if (!regionTouched && ls.region) {
+    const sel = document.getElementById('region');
+    if (sel && Array.from(sel.options).some(o => o.value === ls.region)) {
+      sel.value = ls.region;
+      syncPlanRegion();
+    }
   }
 }
 
@@ -1166,7 +1232,7 @@ class Handler(BaseHTTPRequestHandler):
                     "note": "旧订阅链接已失效，请用新链接重新订阅"}
         elif action == "cost":
             try:
-                resp = {"ok": True, "billing": get_billing()}
+                resp = {"ok": True, "billing": get_billing(), "last_success": get_last_success()}
             except Exception as e:
                 resp = {"ok": False, "output": str(e)}
         elif action == "schedule":

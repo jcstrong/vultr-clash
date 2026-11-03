@@ -217,6 +217,27 @@ last_success_region() {
     jq -r '.region // empty' "$STATE_DIR/last_success.json" 2>/dev/null || true
 }
 
+# 建节点/更新订阅后强刷本机 mihomo 并钉选节点 (2026-11-03)
+# 同 IP 换密码场景 provider 缓存旧密码、AUTO 组卡死旧引用，两连 PUT 才能恢复；mihomo 未配置时静默跳过
+refresh_mihomo() {
+    local ctl secret c1 c2
+    ctl="${MIHOMO_API:-http://127.0.0.1:9090}"
+    secret="$(grep -m1 '^secret:' "$HOME/.config/mihomo/config.yaml" 2>/dev/null | sed 's/^secret: *//; s/"//g')"
+    if [[ -z "$secret" ]]; then
+        log "ℹ 未找到 mihomo secret，跳过本机代理刷新"
+        return 0
+    fi
+    c1="$(curl -s -o /dev/null -w '%{http_code}' -m 8 -X PUT -H "Authorization: Bearer $secret" "$ctl/providers/proxies/vultr" 2>/dev/null || echo 000)"
+    sleep 2
+    c2="$(curl -s -o /dev/null -w '%{http_code}' -m 8 -X PUT -H "Authorization: Bearer $secret" -H 'Content-Type: application/json' -d '{"name":"vultr-ss"}' "$ctl/proxies/Proxy" 2>/dev/null || echo 000)"
+    if [[ "$c1" == 204 && "$c2" == 204 ]]; then
+        log "✓ 本机 mihomo 已刷新并钉选 vultr-ss"
+    else
+        log "⚠ mihomo 刷新未完全成功 (provider=$c1 pin=$c2)，代理可能需手动处理"
+    fi
+    return 0
+}
+
 # 以 start 为起点的区域环序列（去重、截断到 max 个）
 region_sequence() {
     local start="$1" max="$2" list="$3"
@@ -281,6 +302,13 @@ action_create() {
 
     if (( ok )); then
         log "✓ 命中可用节点: region=$region（第 ${n} 次尝试）"
+        # create 后自动跑后续：SSH 校正真实 ss 密码 → 重生成订阅 → 强刷本机 mihomo（2026-11-03 用户需求）
+        log "ℹ 自动执行后续流程: update"
+        if bash "$0" update; then
+            :
+        else
+            log "⚠ 自动 update 失败，订阅/代理可能未同步"
+        fi
     else
         log "✗ create 失败：已尝试区域[${tried_all# }] 共 ${n} 次"
         exit 1
@@ -605,6 +633,8 @@ sync_and_update() {
 
     log "订阅已更新: $ip ($region)"
     connect
+    # 订阅变更后强刷本机 mihomo：provider 重载 + Proxy 钉选（AUTO 组会卡死旧引用）
+    refresh_mihomo
 }
 
 connect() {

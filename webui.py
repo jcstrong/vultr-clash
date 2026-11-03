@@ -620,9 +620,10 @@ def scheduler_loop():
                         sched["last_create_date"] = today
                         save_schedule(sched)
                     elif exists is False:
+                        # create_region/plan 留空 → 不传参 → 脚本按「上次成功地区」优先（v0.5.0, 2026-11-03）
                         res = run_action("create",
-                                         sched.get("create_region") or "ewr",
-                                         sched.get("create_plan") or "vc2-1c-0.5gb")
+                                         (sched.get("create_region") or "").strip(),
+                                         (sched.get("create_plan") or "").strip())
                         busy = res.get("exit") == -1 and "正在执行" in (res.get("output") or "")
                         if not busy:
                             sched["last_create_date"] = today

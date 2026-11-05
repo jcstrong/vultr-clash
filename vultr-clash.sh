@@ -340,6 +340,11 @@ proxy-groups:
       - DIRECT
 
 rules:
+  # tailnet (tailscale) 永远直连 (2026-11-05): Verge 经自身代理拉订阅时 100.64/10/ts.net 不能进 Proxy
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR6,fd7a:115c:a1e0::/48,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,ts.net,DIRECT
+  - DOMAIN-SUFFIX,tailscale.com,DIRECT
   # mini4k: .com 国内DNS被污染(假IP)，必须走代理由节点远程解析；.net 源站异常时代理兜底
   - DOMAIN-SUFFIX,mini4k.com,Proxy
   - DOMAIN-SUFFIX,mini4k.net,DIRECT

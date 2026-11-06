@@ -358,6 +358,58 @@ EOF
 
 # 单次创建尝试；由 action_create 在子 shell 中调用，
 # 失败路径（die）只终止本次尝试，交由上层换区域重试
+# ---------------------------------------------------------------------------
+# Tailscale exit node 部署（2026-11-06）：把节点注册为 tailnet 出口
+# 前提：$STATE_DIR/tailscaled.state.vultr-exit（已注册设备身份备份，2438B）
+# 每次重建新实例后恢复同一身份 → 设备 ID 不变，手机端 Auto exit node 无感切换
+# 任一步失败仅告警跳过，绝不影响 SS 节点本身的创建结果
+# ---------------------------------------------------------------------------
+TS_STATE_BACKUP="$STATE_DIR/tailscaled.state.vultr-exit"
+TS_HOSTNAME="vultr-exit"
+
+setup_tailscale_exit() {
+    local ip="$1" pw="$2"
+    if [[ ! -s "$TS_STATE_BACKUP" ]]; then
+        log "⚠ 未找到 $TS_STATE_BACKUP，跳过 exit node 部署"
+        return 0
+    fi
+    log "部署 Tailscale exit node ($TS_HOSTNAME)..."
+    # 1) 安装 tailscale（幂等）并停服务，准备恢复设备身份
+    if ! ssh_exec "$ip" "$pw" '
+        command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh >/tmp/ts-install.log 2>&1
+        systemctl stop tailscaled >/dev/null 2>&1 || true
+        command -v tailscale >/dev/null 2>&1
+    ' 120 >/dev/null 2>&1; then
+        log "⚠ Tailscale 安装失败，跳过 exit node 部署"
+        return 0
+    fi
+    # 2) 传设备身份文件（管道传文件需要 sshpass；expect 路径不支持，跳过）
+    if ! command -v sshpass >/dev/null 2>&1; then
+        log "⚠ 缺少 sshpass 无法传身份文件，跳过 exit node 部署"
+        return 0
+    fi
+    if ! sshpass -p "$pw" ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        root@"$ip" 'cat > /var/lib/tailscale/tailscaled.state' < "$TS_STATE_BACKUP" >/dev/null 2>&1; then
+        log "⚠ 身份文件传输失败，跳过 exit node 部署"
+        return 0
+    fi
+    # 3) 开转发 + 起服务 + 上线（state 已注册，免授权直连）
+    if ! ssh_exec "$ip" "$pw" '
+        chmod 600 /var/lib/tailscale/tailscaled.state
+        printf "net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n" > /etc/sysctl.d/99-tailscale.conf
+        sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null 2>&1
+        systemctl start tailscaled
+        sleep 3
+        timeout 70 tailscale up --advertise-exit-node --hostname='"'"'"$TS_HOSTNAME"'"'"' --timeout=60s >/dev/null 2>&1
+        tailscale status >/dev/null 2>&1 && echo TS-UP-OK
+    ' 100 2>/dev/null | grep -q TS-UP-OK; then
+        log "⚠ exit node 上线未确认（不影响 SS 节点），可稍后重跑检查"
+        return 0
+    fi
+    log "Tailscale exit node 部署完成: $TS_HOSTNAME（设备身份复用，手机端无感）"
+}
+
 create_attempt() {
     check_api_key
     require_curl; require_jq
@@ -489,6 +541,8 @@ create_attempt() {
                 --arg label "$INSTANCE_LABEL" --argjson now "$(date +%s)" \
                 '{id:$id, region:$region, plan:$plan, ip:$ip, label:$label, succeeded_at:$now}' \
                 > "$STATE_DIR/last_success.json" 2>/dev/null || true
+            # 部署 Tailscale exit node（失败不致命，见函数内告警）(2026-11-06)
+            setup_tailscale_exit "$ip" "$root_pw"
         else
             log "⚠ 节点未完全就绪，立即注销止损..."
             destroy_instance

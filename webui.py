@@ -409,6 +409,8 @@ input:focus{outline:none;border-color:var(--accent)}
 .btn-p{background:var(--accent)}.btn-s{background:#2b3245;border:1px solid var(--border);color:#ddd}
 pre{background:#0a0c11;border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;line-height:1.6;color:#aaa;white-space:pre-wrap;word-break:break-all;min-height:20px;max-height:240px;overflow:auto}
 .ok{color:var(--green)}
+    .subbtn{flex:1;padding:10px 0;border-radius:10px;border:1px solid #2a2e37;background:#1b1e24;color:#9aa0a6;font-size:14px;cursor:pointer}
+    .subbtn.active{background:#10b981;border-color:#10b981;color:#fff;font-weight:600}
 </style>
 </head>
 <body>
@@ -453,7 +455,45 @@ async function runSelftest() {
   out.textContent = lines.join('\n');
 }
 document.getElementById('key').addEventListener('keydown', e => { if (e.key === 'Enter') saveKey(); });
-</script>
+async function doSwitchSub(mode){
+  const j = await api({action:'switch-sub', mode});
+  if(j.ok) setLight(mode); else alert('失败: '+j.output);
+}
+async function doFetchMojie(){
+  const j = await api({action:'fetch-mojie'});
+  alert(j.ok ? '魔戒节点已刷新' : ('失败: '+j.output));
+}
+async function doSaveStc(){
+  const c = document.getElementById('stcBox').value;
+  if(!c.trim()) return alert('请先粘贴订阅内容');
+  const j = await api({action:'save-stc', content: c});
+  alert(j.ok ? 'STC 订阅已导入' : ('失败: '+j.output));
+}
+function setLight(mode){
+  document.getElementById('subv').classList.toggle('active', mode==='vultr'||mode==='all');
+  document.getElementById('subm').classList.toggle('active', mode==='mojie');
+  document.getElementById('subs').classList.toggle('active', mode==='stc');
+}
+async function loadSubMode(){
+  try{ const j = await api({action:'sub-status'}); if(j.ok) setLight(j.mode); }catch(e){}
+}
+loadSubMode();
+}
+async function doFetchMojie(){
+  const j = await api({action:'fetch-mojie'});
+  alert(j.ok ? '魔戒节点已刷新' : ('失败: '+j.output));
+}
+async function doSaveStc(){
+  const c = document.getElementById('stcBox').value;
+  if(!c.trim()) return alert('请先粘贴订阅内容');
+  const j = await api({action:'save-stc', content: c});
+  alert(j.ok ? 'STC 订阅已导入' : ('失败: '+j.output));
+}
+async function loadSubMode(){
+  try{ const j = await api({action:'sub-status'}); if(j.ok) document.getElementById('subModeBadge').textContent = '当前: ' + (j.mode==='all' ? '全自动(三源)' : j.mode); }catch(e){}
+}
+loadSubMode();
+  </script>
 </body>
 </html>"""
 
@@ -771,13 +811,29 @@ select:focus{outline:none;border-color:var(--accent)}
     <div style="height:8px"></div>
     <button class="btn btn-danger btn-full" id="destroyBtn" onclick="doAction('destroy')">销毁节点</button>
   </div>
-
-  <div class="log-card">
+    <div class="log-card">
     <div class="log-header">
       <h3>操作日志</h3>
       <span style="font-size:12px;color:var(--muted)" id="logTime"></span>
     </div>
     <div class="log-body" id="logBody">__PROGRESS_LOG__</div>
+  </div>
+
+  <div class="log-card">
+    <div class="log-header"><h3>订阅源</h3></div>
+    <div style="padding:12px;display:flex;gap:8px">
+      <button class="subbtn" id="subv" onclick="doSwitchSub('vultr')">Vultr</button>
+      <button class="subbtn" id="subm" onclick="doSwitchSub('mojie')">魔戒</button>
+      <button class="subbtn" id="subs" onclick="doSwitchSub('stc')">STC</button>
+    </div>
+    <details style="padding:0 12px 12px;font-size:12px">
+      <summary style="cursor:pointer;color:var(--muted)">高级: STC 订阅导入 / 刷新魔戒</summary>
+      <div style="display:flex;gap:8px;margin:8px 0"><button class="btn btn-secondary" onclick="doFetchMojie()">🔄 刷新魔戒节点</button></div>
+      <textarea id="stcBox" placeholder="浏览器打开 STC 订阅链接过验证, 全选复制粘到这里" style="width:100%;min-height:70px;background:#1b1e24;color:#e6e6e6;border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px"></textarea>
+      <div style="height:6px"></div>
+      <button class="btn btn-secondary btn-full" onclick="doSaveStc()">⬆️ 导入 STC 订阅</button>
+    </details>
+    <div style="padding:0 12px 12px;font-size:12px;color:var(--muted)">点 Vultr = 优先 Vultr, 挂了自动用魔戒/STC 顶上。</div>
   </div>
 
   <div class="sub-card">
@@ -1265,6 +1321,66 @@ class Handler(BaseHTTPRequestHandler):
                 thread = threading.Thread(target=run_in_background, daemon=True)
                 thread.start()
                 resp = {"ok": True, "output": "任务已启动，请查看日志", "started": True}
+        elif action == "switch-sub":
+            mode = (data.get("mode") or "").strip()
+            names = {"all": "全自动(三源)", "vultr": "Vultr", "mojie": "魔戒", "stc": "STC"}
+            if mode not in names:
+                resp = {"ok": False, "output": "未知模式(可选 all/vultr/mojie/stc)"}
+            else:
+                try:
+                    import re, subprocess, urllib.request, json as _json
+                    p = "/home/jun/.config/mihomo/config.yaml"
+                    s = open(p).read()
+                    use = "[vultr, mojie, stc]" if mode == "all" else "[" + mode + "]"
+                    s2 = re.sub(r"use: \[[^\]]*\]", "use: " + use, s)
+                    if s2 == s:
+                        resp = {"ok": False, "output": "配置未修改(未找到 use 行)"}
+                    else:
+                        open(p + ".swp", "w").write(s2)
+                        t = subprocess.run(["/usr/local/bin/mihomo", "-d", "/home/jun/.config/mihomo", "-t", "-f", p + ".swp"], capture_output=True, text=True, timeout=30)
+                        if t.returncode != 0:
+                            resp = {"ok": False, "output": "校验失败未切换: " + (t.stderr or t.stdout)[-180:]}
+                        else:
+                            subprocess.run(["cp", p + ".swp", p], check=True)
+                            sec = ""
+                            for _l in open(p):
+                                if _l.startswith("secret:"):
+                                    import re as _re
+                                    _m = _re.search(r'"([^"]+)"', _l)
+                                    if _m: sec = _m.group(1)
+                            req = urllib.request.Request("http://127.0.0.1:9090/configs?force=true",
+                                data=_json.dumps({"path": p, "payload": ""}).encode(),
+                                headers={"Authorization": "Bearer " + sec, "Content-Type": "application/json"}, method="PUT")
+                            urllib.request.urlopen(req, timeout=15)
+                            open("/home/jun/vultr-clash/.state/sub-mode", "w").write(mode)
+                            append_log("✓ 订阅切换: " + names[mode])
+                            resp = {"ok": True, "output": "已切换: " + names[mode]}
+                except Exception as e:
+                    resp = {"ok": False, "output": "切换失败: " + str(e)[:200]}
+        elif action == "save-stc":
+            content = data.get("content") or ""
+            head = content[:500].lower()
+            if "proxies:" not in content:
+                resp = {"ok": False, "output": "未找到 proxies 段, 请粘贴 Clash 格式订阅"}
+            elif "<html" in head or "just a moment" in head:
+                resp = {"ok": False, "output": "这是 Cloudflare 拦截页, 请在浏览器通过验证拿到订阅内容"}
+            else:
+                open("/home/jun/.config/mihomo/stc.yaml", "w").write(content)
+                append_log("✓ STC 订阅内容导入")
+                resp = {"ok": True, "output": "STC 订阅已导入"}
+        elif action == "fetch-mojie":
+            import subprocess
+            r = subprocess.run(["curl", "-sk", "-m", "20", "-o", "/home/jun/.config/mihomo/mojie.yaml",
+                "https://47.112.97.173:5000/api/v1/client/subscribe?token=c8d358708b731ff640789c69eb722b71&flag=clash"], capture_output=True, text=True, timeout=30)
+            ok = r.returncode == 0 and "proxies:" in open("/home/jun/.config/mihomo/mojie.yaml").read()
+            append_log(("✓" if ok else "✗") + " 魔戒订阅刷新")
+            resp = {"ok": ok, "output": "魔戒节点已刷新" if ok else "魔戒刷新失败"}
+        elif action == "sub-status":
+            try:
+                mode = open("/home/jun/vultr-clash/.state/sub-mode").read().strip() or "all"
+                resp = {"ok": True, "mode": mode}
+            except Exception:
+                resp = {"ok": True, "mode": "all"}
         else:
             resp = {"ok": False, "output": "未知操作"}
             

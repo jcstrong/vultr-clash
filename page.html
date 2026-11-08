@@ -171,6 +171,23 @@ select:focus{outline:none;border-color:var(--accent)}
     <div style="height:8px"></div>
     <button class="btn btn-danger btn-full" id="destroyBtn" onclick="doAction('destroy')">销毁节点</button>
   </div>
+  <div class="log-card">
+    <div class="log-header"><h3>备用订阅切换</h3><span id="subModeBadge" style="font-size:12px;color:var(--muted)"></span></div>
+    <div style="padding:12px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-secondary" onclick="doSwitchSub('all')">🛡️ 全自动(三源)</button>
+      <button class="btn btn-secondary" onclick="doSwitchSub('vultr')">Vultr</button>
+      <button class="btn btn-secondary" onclick="doSwitchSub('mojie')">魔戒</button>
+      <button class="btn btn-secondary" onclick="doSwitchSub('stc')">STC</button>
+    </div>
+    <div style="padding:0 12px 8px"><button class="btn btn-secondary" onclick="doFetchMojie()">🔄 刷新魔戒节点</button></div>
+    <div style="padding:0 12px 12px">
+      <textarea id="stcBox" placeholder="粘贴 STC 订阅内容(Clash YAML): 浏览器打开订阅链接过验证后, 全选复制粘到这里" style="width:100%;min-height:70px;background:#1b1e24;color:#e6e6e6;border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px"></textarea>
+      <div style="height:6px"></div>
+      <button class="btn btn-secondary btn-full" onclick="doSaveStc()">⬆️ 导入 STC 订阅</button>
+    </div>
+    <div style="padding:0 12px 12px;font-size:12px;color:var(--muted)">Vultr 完全不可用时切魔戒/STC 顶上; 全自动模式健康检查自动跳过死源。</div>
+  </div>
+
 
   <div class="log-card">
     <div class="log-header">
@@ -552,6 +569,25 @@ loadCost();
 loadLog();
 
 // 操作执行期间由 doAction 内部轮询日志；无操作时不再自动刷新
+async function doSwitchSub(mode){
+  const j = await api({action:'switch-sub', mode});
+  alert(j.ok ? ('已切换: '+j.output) : ('失败: '+j.output));
+  loadSubMode();
+}
+async function doFetchMojie(){
+  const j = await api({action:'fetch-mojie'});
+  alert(j.ok ? '魔戒节点已刷新' : ('失败: '+j.output));
+}
+async function doSaveStc(){
+  const c = document.getElementById('stcBox').value;
+  if(!c.trim()) return alert('请先粘贴订阅内容');
+  const j = await api({action:'save-stc', content: c});
+  alert(j.ok ? 'STC 订阅已导入' : ('失败: '+j.output));
+}
+async function loadSubMode(){
+  try{ const j = await api({action:'sub-status'}); if(j.ok) document.getElementById('subModeBadge').textContent = '当前: ' + (j.mode==='all' ? '全自动(三源)' : j.mode); }catch(e){}
+}
+loadSubMode();
 </script>
 </body>
 </html>

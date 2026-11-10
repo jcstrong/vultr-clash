@@ -354,6 +354,85 @@ def get_instance_status():
         instance["create_duration"] = duration
     return instance
 
+def get_mihomo_status():
+    """本机 mihomo 出口链与机场 provider 存活状态（vultr 无节点时也展示兜底出口）"""
+    import urllib.request
+    cfg = os.path.expanduser("~/.config/mihomo/config.yaml")
+    secret = ""
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("secret:"):
+                    secret = line.split(":", 1)[1].strip().strip('"').strip("'")
+                    break
+    except OSError:
+        pass
+    def _get(path):
+        req = urllib.request.Request(
+            "http://127.0.0.1:9090" + path,
+            headers={"Authorization": "Bearer " + secret})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    try:
+        p = (_get("/proxies").get("proxies") or {})
+        provs = (_get("/providers/proxies").get("providers") or {})
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    chain, cur, seen = [], "Proxy", set()
+    while cur in p and cur not in seen and len(chain) < 5:
+        seen.add(cur)
+        cur = p[cur].get("now", "") or ""
+        if cur:
+            chain.append(cur)
+    exit_node = chain[-1] if chain else ""
+    providers = []
+    for name, pv in provs.items():
+        # 只显示真订阅源（HTTP/File），滤掉 Compatible 内部组
+        if pv.get("vehicleType") not in ("HTTP", "File", "Local"):
+            continue
+        pl = pv.get("proxies") or []
+        if not pl:
+            continue
+        providers.append({
+            "name": name,
+            "alive": sum(1 for x in pl if x.get("alive")),
+            "total": len(pl),
+            "has_exit": any(x.get("name") == exit_node for x in pl),
+        })
+    providers.sort(key=lambda x: (not x["has_exit"], x["name"]))
+    now = p.get("Proxy", {}).get("now", "")
+    return {"ok": True, "now": now, "chain": " → ".join(chain), "exit": exit_node,
+            "providers": providers}
+
+def set_mihomo_exit(target):
+    """面板手动开关：PUT mihomo Proxy 组出口（DIRECT/魔戒/STC/vultr-ss），不做任何自动兜底"""
+    import urllib.request
+    cfg = os.path.expanduser("~/.config/mihomo/config.yaml")
+    secret = ""
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("secret:"):
+                    secret = line.split(":", 1)[1].strip().strip('"').strip("'")
+                    break
+    except OSError:
+        pass
+    req = urllib.request.Request(
+        "http://127.0.0.1:9090/proxies/Proxy",
+        data=json.dumps({"name": target}).encode("utf-8"),
+        headers={"Authorization": "Bearer " + secret,
+                 "Content-Type": "application/json"},
+        method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            code = r.status
+    except Exception as e:
+        return {"ok": False, "output": str(e)[:160]}
+    if not (200 <= code < 300):
+        return {"ok": False, "output": "mihomo API 返回 " + str(code)}
+    append_log("🎚 出口切换 → " + target)
+    return {"ok": True, "mihomo": get_mihomo_status()}
+
 def render_page():
     values = {
         "__NODE_DOT_CLASS__": "off",
@@ -792,12 +871,14 @@ select:focus{outline:none;border-color:var(--accent)}
 
   <div class="action-card">
     <div class="row">
-      <select id="region">
+      <select id="region" onchange="document.getElementById('plan').value = (this.value==='ewr') ? 'vc2-1c-0.5gb' : 'vc2-1c-1gb'">
         <option value="ewr" selected>ewr · 新泽西 (New Jersey)</option>
         <option value="nrt">nrt · 东京 (Tokyo)</option>
         <option value="sgp">sgp · 新加坡 (Singapore)</option>
         <option value="icn">icn · 首尔 (Seoul)</option>
         <option value="lax">lax · 洛杉矶 (LA)</option>
+        <option value="sjc">sjc · 硅谷圣何塞 (San Jose)</option>
+        <option value="sea">sea · 西雅图 (Seattle)</option>
         <option value="fra">fra · 法兰克福 (Frankfurt)</option>
       </select>
       <select id="plan">
@@ -817,23 +898,6 @@ select:focus{outline:none;border-color:var(--accent)}
       <span style="font-size:12px;color:var(--muted)" id="logTime"></span>
     </div>
     <div class="log-body" id="logBody">__PROGRESS_LOG__</div>
-  </div>
-
-  <div class="log-card">
-    <div class="log-header"><h3>订阅源</h3></div>
-    <div style="padding:12px;display:flex;gap:8px">
-      <button class="subbtn" id="subv" onclick="doSwitchSub('vultr')">Vultr</button>
-      <button class="subbtn" id="subm" onclick="doSwitchSub('mojie')">魔戒</button>
-      <button class="subbtn" id="subs" onclick="doSwitchSub('stc')">STC</button>
-    </div>
-    <details style="padding:0 12px 12px;font-size:12px">
-      <summary style="cursor:pointer;color:var(--muted)">高级: STC 订阅导入 / 刷新魔戒</summary>
-      <div style="display:flex;gap:8px;margin:8px 0"><button class="btn btn-secondary" onclick="doFetchMojie()">🔄 刷新魔戒节点</button></div>
-      <textarea id="stcBox" placeholder="浏览器打开 STC 订阅链接过验证, 全选复制粘到这里" style="width:100%;min-height:70px;background:#1b1e24;color:#e6e6e6;border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px"></textarea>
-      <div style="height:6px"></div>
-      <button class="btn btn-secondary btn-full" onclick="doSaveStc()">⬆️ 导入 STC 订阅</button>
-    </details>
-    <div style="padding:0 12px 12px;font-size:12px;color:var(--muted)">点 Vultr = 优先 Vultr, 挂了自动用魔戒/STC 顶上。</div>
   </div>
 
   <div class="sub-card">
@@ -886,6 +950,33 @@ select:focus{outline:none;border-color:var(--accent)}
       <dt>自动创建</dt><dd id="scCreate">加载中…</dd>
       <dt>销毁通知</dt><dd id="scBark">加载中…</dd>
     </dl>
+  </div>
+
+  <style>
+  .switch{position:relative;display:inline-block;width:46px;height:26px;flex:none}
+  .switch input{opacity:0;width:0;height:0}
+  .switch .slider{position:absolute;cursor:pointer;inset:0;background:#3a3f47;border-radius:26px;transition:.2s}
+  .switch .slider:before{content:"";position:absolute;height:20px;width:20px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+  .switch input:checked + .slider{background:#2ea86c}
+  .switch input:checked + .slider:before{transform:translateX(20px)}
+  .switch input:disabled + .slider{opacity:.35;cursor:not-allowed}
+  </style>
+  <div class="node-card" id="exitCard">
+    <div class="node-header">
+      <span class="node-name">🎚️ 手动兜底开关</span>
+      <span class="node-status on" id="exitNow">…</span>
+    </div>
+    <div style="padding:14px 12px;display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <span style="font-size:14px">魔戒机场</span>
+        <label class="switch"><input type="checkbox" id="swMojie" onchange="toggleExit('魔戒')"><span class="slider"></span></label>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <span style="font-size:14px">STC机场</span>
+        <label class="switch"><input type="checkbox" id="swStc" onchange="toggleExit('STC')"><span class="slider"></span></label>
+      </div>
+    </div>
+    <div style="padding:0 12px 12px;font-size:12px;color:var(--muted)" id="exitHint">…</div>
   </div>
 
 </div>
@@ -946,6 +1037,14 @@ async function runSelftest() {
   }
 }
 
+function setDD(id, label, val) {
+  const dd = document.getElementById(id);
+  if (!dd) return;
+  const dt = dd.previousElementSibling;
+  if (dt && dt.tagName === 'DT') dt.textContent = label;
+  dd.textContent = val;
+}
+
 async function loadStatus() {
   try {
     const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
@@ -962,8 +1061,8 @@ async function loadStatus() {
       document.getElementById('nodeName').textContent = inst.region + ' (' + inst.main_ip + ')';
       document.getElementById('nodeStatus').className = running ? 'node-status on' : 'node-status off';
       document.getElementById('nodeStatus').textContent = running ? (readyInit ? '运行中' : '初始化中…') : inst.status;
-      document.getElementById('niRegion').textContent = inst.region;
-      document.getElementById('niPlan').textContent = inst.plan;
+      setDD('niRegion', '地区', inst.region);
+      setDD('niPlan', '套餐', inst.plan);
       document.getElementById('niIP').textContent = inst.main_ip;
       document.getElementById('niPass').textContent = inst.ss_password || '-';
       document.getElementById('niCreateTime').textContent = inst.create_duration != null ? inst.create_duration + ' 秒' : '-';
@@ -973,14 +1072,17 @@ async function loadStatus() {
       currentSub = j.subscription_url || '';
       return;
     }
+    const mh = j.mihomo || null;
+    const mhOk = !!(mh && mh.ok);
     document.getElementById('nodeDot').className = 'dot off';
-    document.getElementById('nodeLabel').textContent = '无节点';
-    document.getElementById('nodeCard').className = 'node-card inactive';
-    document.getElementById('nodeName').textContent = '无活跃节点';
-    document.getElementById('nodeStatus').className = 'node-status off';
-    document.getElementById('nodeStatus').textContent = '未激活';
-    document.getElementById('niRegion').textContent = '-';
-    document.getElementById('niPlan').textContent = '-';
+    document.getElementById('nodeLabel').textContent = '无vultr节点';
+    document.getElementById('nodeCard').className = mhOk ? 'node-card active' : 'node-card inactive';
+    document.getElementById('nodeName').textContent = (mhOk && mh.exit) ? mh.exit : '无活跃节点';
+    document.getElementById('nodeStatus').className = mhOk ? 'node-status on' : 'node-status off';
+    document.getElementById('nodeStatus').textContent = mhOk ? 'mihomo 兜底中' : '未激活';
+    setDD('niRegion', '当前出口', mhOk ? (mh.chain || '-') : '-');
+    setDD('niPlan', '机场存活', (mhOk && mh.providers && mh.providers.length)
+      ? mh.providers.map(p => p.name + ' ' + p.alive + '/' + p.total).join(' · ') : '-');
     document.getElementById('niIP').textContent = '-';
     document.getElementById('niPass').textContent = '-';
     document.getElementById('updateBtn').disabled = true;
@@ -1204,10 +1306,39 @@ document.getElementById('keyInput').addEventListener('keydown', e => {
 });
 
 // 初始加载（各页首次各请求一次，后续用户手动刷新）
+let currentExit = '';
+async function loadExit() {
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"status"})});
+    const j = await r.json();
+    const mh = j.mihomo || {};
+    currentExit = mh.now || mh.exit || '未知';
+    const el = document.getElementById('exitNow');
+    if (el) el.textContent = '出口: ' + currentExit + ((mh.exit && mh.exit !== currentExit) ? ' → ' + mh.exit : '');
+    const vultrRunning = !!(j.instance && j.instance.status === 'active' && j.instance.power_status === 'running');
+    const m = document.getElementById('swMojie'), s = document.getElementById('swStc');
+    if (m) { m.checked = (currentExit === '魔戒'); m.disabled = vultrRunning; }
+    if (s) { s.checked = (currentExit === 'STC'); s.disabled = vultrRunning; }
+    const hint = document.getElementById('exitHint');
+    if (hint) hint.textContent = vultrRunning
+      ? 'vultr 运行中，无需兜底（开关已自动关闭）'
+      : '打开即接管全部代理流量；关闭回直连 DIRECT。tailscale / opencode.ai 永远直连，不受影响。';
+  } catch(e) {}
+}
+async function toggleExit(name) {
+  const target = (currentExit === name) ? 'DIRECT' : name;
+  const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({action:"mihomo-exit", target})});
+  const j = await r.json();
+  if (!j.ok) alert('切换失败: ' + (j.output || '未知错误'));
+  loadExit(); loadStatus();
+}
 loadStatus();
 loadCost();
 loadLog();
 loadSchedule();
+loadExit();
 
 // 操作执行期间由 doAction 内部轮询日志；无操作时不再自动刷新
 </script>
@@ -1277,6 +1408,12 @@ class Handler(BaseHTTPRequestHandler):
                 save_api_key(key)
                 append_log("✓ API Key 已保存并校验通过")
             resp = res
+        elif action == "mihomo-exit":
+            target = (data.get("target") or "DIRECT").strip()
+            if target not in ("DIRECT", "魔戒", "STC", "vultr-ss"):
+                resp = {"ok": False, "output": "非法出口: " + target}
+            else:
+                resp = set_mihomo_exit(target)
         elif action == "getlog":
             resp = {"ok": True, "log": read_log()}
         elif action == "isbusy":
@@ -1303,7 +1440,8 @@ class Handler(BaseHTTPRequestHandler):
         elif action in ["connect", "status"]:
             sub_url = resolve_sub_url()
             try:
-                resp = {"ok": True, "instance": get_instance_status(), "subscription_url": sub_url}
+                resp = {"ok": True, "instance": get_instance_status(), "subscription_url": sub_url,
+                        "mihomo": get_mihomo_status()}
             except Exception as e:
                 resp = {"ok": False, "output": str(e), "subscription_url": sub_url}
         elif action in ["create", "destroy", "update"]:

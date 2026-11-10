@@ -238,6 +238,22 @@ refresh_mihomo() {
     return 0
 }
 
+# 2026-11-10 手动开关制（用户指令）：节点销毁后出口确定性回 DIRECT。
+# 不做自动兜底——魔戒/STC 机场只由 8333 面板开关手动启用。
+set_mihomo_direct() {
+    local ctl secret c
+    ctl="${MIHOMO_API:-http://127.0.0.1:9090}"
+    secret="$(grep -m1 '^secret:' "$HOME/.config/mihomo/config.yaml" 2>/dev/null | sed 's/^secret: *//; s/"//g')"
+    [[ -n "$secret" ]] || return 0
+    c="$(curl -s -o /dev/null -w '%{http_code}' -m 8 -X PUT -H "Authorization: Bearer $secret" -H 'Content-Type: application/json' -d '{"name":"DIRECT"}' "$ctl/proxies/Proxy" 2>/dev/null || echo 000)"
+    if [[ "$c" == 204 ]]; then
+        log "✓ mihomo 出口已回 DIRECT（手动开关制，不自动兜底）"
+    else
+        log "⚠ mihomo 出口回 DIRECT 未成功 (http=$c)"
+    fi
+    return 0
+}
+
 # 以 start 为起点的区域环序列（去重、截断到 max 个）
 region_sequence() {
     local start="$1" max="$2" list="$3"
@@ -589,6 +605,9 @@ destroy_instance() {
     # 清空 clash.yaml
     echo "# 当前无活跃节点，请先 create" > "$CLASH_YAML"
     log "已销毁，clash.yaml 已清空"
+
+    # 手动开关制：销毁后出口回 DIRECT，魔戒/STC 只由面板开关手动启用
+    set_mihomo_direct
 }
 
 get_subscription_url() {

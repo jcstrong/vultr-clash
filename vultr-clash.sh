@@ -14,7 +14,8 @@ SS_PORT=8388
 VULTR_API_KEY="${VULTR_API_KEY:-}"
 VULTR_REGION="${VULTR_REGION:-nrt}"
 VULTR_PLAN="${VULTR_PLAN:-vc2-1c-1gb}"
-VULTR_OS_ID="${VULTR_OS_ID:-2136}"
+# 镜像 ID 留空 = 每次创建时动态解析最新 Ubuntu LTS（2026-11-11 事故：2136 被下架后新装实例 v4 全黑洞两天）
+VULTR_OS_ID="${VULTR_OS_ID:-}"
 INSTANCE_LABEL="${INSTANCE_LABEL:-clash-ss}"
 
 mkdir -p "$STATE_DIR"
@@ -151,6 +152,67 @@ check_api_key() {
     [[ -n "$VULTR_API_KEY" ]] || die "未设置 VULTR_API_KEY"
 }
 
+# ---- 动态镜像解析（2026-11-12）：写死的镜像 ID 终会被 Vultr 下架，改为每次校验+按需重解析 ----
+# os_lts_candidates：按版本从新到旧列出 Ubuntu LTS x64 的镜像 ID（每行一个）
+os_lts_candidates() {
+    curl -4 -sS --noproxy '*' -m 20 \
+        -H "Authorization: Bearer $VULTR_API_KEY" \
+        'https://api.vultr.com/v2/os?per_page=100' 2>/dev/null \
+      | jq -r '.os[]
+                | select(.name | test("^Ubuntu [0-9]+[.]04 LTS x64$"))
+                | [(.name | capture("^Ubuntu (?<v>[0-9]+)[.]04").v | tonumber), (.id|tostring)]
+                | @tsv' 2>/dev/null \
+      | sort -rn | cut -f2
+}
+
+OS_CACHE_FILE="$STATE_DIR/os-cache.json"
+
+os_cache_get() {
+    [[ -f "$OS_CACHE_FILE" ]] || return 1
+    jq -r --arg k "$1" '.[$k].os_id // empty' "$OS_CACHE_FILE" 2>/dev/null
+}
+
+os_cache_put() {
+    mkdir -p "$STATE_DIR"
+    jq --arg k "$1" --arg id "$2" --arg n "$3" --argjson now "$(date +%s)" \
+       '.[$k] = {os_id:$id, name:$n, resolved_at:$now}' "$OS_CACHE_FILE" 2>/dev/null \
+       > "$OS_CACHE_FILE.tmp" && mv "$OS_CACHE_FILE.tmp" "$OS_CACHE_FILE" || true
+}
+
+os_id_still_valid() {
+    local code
+    code="$(curl -4 -sS --noproxy '*' -o /dev/null -w '%{http_code}' -m 12 \
+        -H "Authorization: Bearer $VULTR_API_KEY" \
+        "https://api.vultr.com/v2/os/${1}" 2>/dev/null || echo 000)"
+    [[ "$code" == "200" ]]
+}
+
+# resolve_os_for_plan <plan>：显式 VULTR_OS_ID 优先（不兜底，尊重显式意图）；
+# 否则缓存 ID（先用 /v2/os/{id} 校验仍在目录，404 即作废重解析），后接全部 LTS 候选兜底
+resolve_os_for_plan() {
+    local plan="$1" cached rest
+    if [[ -n "$VULTR_OS_ID" ]]; then
+        printf '%s\n' "$VULTR_OS_ID"
+        return 0
+    fi
+    cached="$(os_cache_get "$plan" || true)"
+    if [[ -n "$cached" ]] && ! os_id_still_valid "$cached"; then
+        log "⚠ 缓存镜像 id=$cached 已从 Vultr 目录下架(404)，重新解析最新 Ubuntu LTS"
+        cached=""
+    fi
+    rest="$(os_lts_candidates)"
+    if [[ -z "$rest" ]]; then
+        [[ -n "$cached" ]] && { printf '%s\n' "$cached"; return 0; }
+        die "无法从 /v2/os 解析 Ubuntu LTS 镜像列表（API 异常？）"
+    fi
+    if [[ -n "$cached" ]]; then
+        printf '%s\n' "$cached"
+        printf '%s\n' "$rest" | grep -vx "$cached" || true
+    else
+        printf '%s\n' "$rest"
+    fi
+}
+
 make_cloudinit() {
     local password="$1"
     local result
@@ -170,15 +232,18 @@ ssh_wait_tries() {
     printf '%s' "$v"
 }
 
+# 双栈 SSH 等待：v4/v6 任一通即返回，成功地址写入全局 SSH_ADDR（供后续 ssh_exec/port_open 复用）
+# 2026-11-12：Vultr v4 IP 池偶发"出生即 null-route"（v6 正常），双栈探测让部署不再被 v4 黑洞卡死
+SSH_ADDR=""
 wait_for_ssh() {
-    local ip="$1"
+    local ip="$1" ip6="${2:-}"
     local tries=0 max interval
     max="$(ssh_wait_tries)"
     interval="${VULTR_SSH_WAIT_INTERVAL:-5}"
+    SSH_ADDR=""
     while (( tries < max )); do
-        if port_open "$ip" 22; then
-            return 0
-        fi
+        if port_open "$ip" 22; then SSH_ADDR="$ip"; return 0; fi
+        if [[ -n "$ip6" ]] && port_open "$ip6" 22; then SSH_ADDR="$ip6"; return 0; fi
         tries=$((tries + 1))
         (( tries < max )) && sleep "$interval"
     done
@@ -334,27 +399,50 @@ action_create() {
 }
 
 update_clash_yaml() {
-    local ip="$1" password="$2"
-    cat > "$CLASH_YAML" <<EOF
+    # 2026-11-12 双栈：同时输出 vultr-ss4 / vultr-ss6 两个节点 + url-test 自动切换组。
+    # 节点名不再叫 vultr-ss —— 该名字保留给本机 mihomo 主配置里的 url-test 组（见 ~/.config/mihomo/config.yaml），
+    # 避免 provider 节点与主配置组重名冲突；webui 面板钉选/回 DIRECT 逻辑继续用 "vultr-ss" 不变。
+    local ip="$1" ip6="${2:-}" password="$3"
+    {
+        cat <<EOF
 mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
 
 proxies:
-  - name: "vultr-ss"
+  - name: "vultr-ss4"
     type: ss
     server: ${ip}
     port: ${SS_PORT}
     cipher: aes-256-gcm
     password: "${password}"
     udp: true
+EOF
+        if [[ -n "$ip6" ]]; then
+        cat <<EOF
+  - name: "vultr-ss6"
+    type: ss
+    server: ${ip6}
+    port: ${SS_PORT}
+    cipher: aes-256-gcm
+    password: "${password}"
+    udp: true
+EOF
+        fi
+        cat <<EOF
 
 proxy-groups:
+  - name: "vultr-auto"
+    type: url-test
+    url: "http://www.gstatic.com/generate_204"
+    interval: 120
+    proxies: [vultr-ss4${ip6:+, vultr-ss6}]
+
   - name: "Proxy"
     type: select
     proxies:
-      - vultr-ss
+      - vultr-auto
       - DIRECT
 
 rules:
@@ -371,7 +459,8 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,Proxy
 EOF
-    log "已更新 clash.yaml"
+    } > "$CLASH_YAML"
+    log "已更新 clash.yaml (v4: ${ip}${ip6:+, v6: ${ip6}})"
 }
 
 # 单次创建尝试；由 action_create 在子 shell 中调用，
@@ -451,20 +540,34 @@ create_attempt() {
     local userdata
     userdata="$(make_cloudinit "$ss_password" | b64)"
 
-    log "正在创建实例: region=$region plan=$plan"
-    local payload
-    payload="$(jq -n \
-        --arg region "$region" \
-        --arg plan "$plan" \
-        --arg os_id "$VULTR_OS_ID" \
-        --arg label "$INSTANCE_LABEL" \
-        --arg userdata "$userdata" \
-        '{region:$region, plan:$plan, os_id:$os_id, label:$label, user_data:$userdata}')"
-
-    local resp
+    local resp payload os_list oci made=0
+    os_list="$(resolve_os_for_plan "$plan")"
+    [[ -n "$os_list" ]] || die "无可用镜像候选"
     # 注意：本函数在 if 条件的子 shell 中运行，set -e 被抑制，
     # vultr_api 在 $( ) 内 die 只终止替换 shell —— 必须显式 || die 快速失败
-    resp="$(vultr_api POST /v2/instances "$payload")" || die "创建实例 API 调用失败"
+    while IFS= read -r oci; do
+        [[ -n "$oci" ]] || continue
+        payload="$(jq -n \
+            --arg region "$region" \
+            --arg plan "$plan" \
+            --arg os_id "$oci" \
+            --arg label "$INSTANCE_LABEL" \
+            --arg userdata "$userdata" \
+            '{region:$region, plan:$plan, os_id:$os_id, enable_ipv6:true, label:$label, user_data:$userdata}')"
+        log "正在创建实例: region=$region plan=$plan os_id=$oci"
+        resp="$(vultr_api POST /v2/instances "$payload" 2>&1)" || {
+            if printf '%s' "$resp" | grep -q 'requires a plan with at least'; then
+                log "⚠ 镜像 $oci 内存要求超出套餐 $plan，自动降级下一个候选"
+                continue
+            fi
+            die "创建实例 API 调用失败: $(printf '%s' "$resp" | tr '\n' ' ' | head -c 200)"
+        }
+        os_cache_put "$plan" "$oci" "$(printf '%s' "$resp" | jq -r '.instance.os // empty' 2>/dev/null)"
+        made=1
+        break
+    done <<< "$os_list"
+    [[ "$made" == 1 && -n "$(printf '%s' "$resp" | jq -r '.instance.id // empty' 2>/dev/null)" ]] \
+        || die "创建实例失败：所有镜像候选均被拒绝（套餐内存不足或目录异常）"
     printf '%s\n' "$resp" > "$INSTANCE_FILE"
     chmod 600 "$INSTANCE_FILE"
     printf '%s\n' "$resp" > "$STATE_DIR/create-response.json"
@@ -476,11 +579,12 @@ create_attempt() {
     # 开始计费记账（active=true）
     add_billing_record "$id" "$region" "$plan"
 
-    local ip=""
+    local ip="" v6ip=""
     local tries=0
     log "等待 IP 分配..."
     while (( tries < 20 )); do
         ip="$(echo "$resp" | jq -r '.instance.main_ip // empty')"
+        v6ip="$(echo "$resp" | jq -r '.instance.v6_main_ip // empty')"
         [[ -n "$ip" && "$ip" != "0.0.0.0" ]] && break
         sleep 5
         resp="$(vultr_api GET "/v2/instances/${id}")" || die "查询实例 API 调用失败"
@@ -488,36 +592,49 @@ create_attempt() {
         tries=$((tries + 1))
     done
     [[ -n "$ip" && "$ip" != "0.0.0.0" ]] || die "获取 IP 超时"
+    # v6 可能比 v4 晚几秒分配，最多补查 4 次
+    if [[ -z "$v6ip" || "$v6ip" == "null" ]]; then
+        local vt=0
+        while (( vt < 4 )); do
+            sleep 5
+            resp="$(vultr_api GET "/v2/instances/${id}")" || break
+            v6ip="$(echo "$resp" | jq -r '.instance.v6_main_ip // empty')"
+            [[ -n "$v6ip" && "$v6ip" != "null" ]] && break
+            vt=$((vt + 1))
+        done
+    fi
+    [[ -z "$v6ip" || "$v6ip" == "null" ]] && v6ip=""
 
-    log "IP: $ip"
-    log "等待 SSH..."
-    if wait_for_ssh "$ip"; then
-        log "SSH 就绪"
+    log "IP: $ip (v6: ${v6ip:-未分配})"
+    log "等待 SSH (v4/v6 双栈探测)..."
+    if wait_for_ssh "$ip" "$v6ip"; then
+        log "SSH 就绪 via ${SSH_ADDR}"
         # 先记录实例信息（节点已创建成功，必须落盘，避免后续 destroy/update 找不到）
         local root_pw
         root_pw="$(echo "$resp" | jq -r '.instance.default_password // empty')"
         echo "$resp" | jq --arg pw "$ss_password" --arg rpw "$root_pw" \
-            '{instance: {id: .instance.id, main_ip: .instance.main_ip, region: .instance.region, plan: .instance.plan, ss_password: $pw, default_password: $rpw}}' \
+            --arg v6 "$v6ip" --arg saddr "$SSH_ADDR" \
+            '{instance: {id: .instance.id, main_ip: .instance.main_ip, v6_ip: $v6, ssh_addr: $saddr, region: .instance.region, plan: .instance.plan, ss_password: $pw, default_password: $rpw}}' \
             > "$INSTANCE_FILE"
         chmod 600 "$INSTANCE_FILE"
-        update_clash_yaml "$ip" "$ss_password"
+        update_clash_yaml "$ip" "$v6ip" "$ss_password"
 
         log "等待 shadowsocks 端口(8388)开放..."
         local sstries=0
         while (( sstries < 30 )); do
-            if port_open "$ip" "$SS_PORT"; then
+            if port_open "$SSH_ADDR" "$SS_PORT"; then
                 break
             fi
             sstries=$((sstries + 1))
             sleep 5
         done
 
-        if port_open "$ip" "$SS_PORT"; then
+        if port_open "$SSH_ADDR" "$SS_PORT"; then
             log "shadowsocks 端口已开放"
         else
             log "shadowsocks 端口未开放，尝试 SSH 远程修复（放行防火墙/重启服务）..."
             local fixed=0
-            if ssh_exec "$ip" "$root_pw" '
+            if ssh_exec "$SSH_ADDR" "$root_pw" '
                 ufw allow 8388/tcp >/dev/null 2>&1 || true
                 ufw allow 8388/udp >/dev/null 2>&1 || true
                 systemctl restart shadowsocks-libev >/dev/null 2>&1 || \
@@ -525,7 +642,7 @@ create_attempt() {
             ' 10; then
                 local stries=0
                 while (( stries < 12 )); do
-                    if port_open "$ip" "$SS_PORT"; then
+                    if port_open "$SSH_ADDR" "$SS_PORT"; then
                         fixed=1
                         break
                     fi
@@ -545,7 +662,7 @@ create_attempt() {
         # 标记初始化完成（SSH + 8388 均就绪才置 true，供前端控制"更新订阅"按钮）
         local init_ok=0 init_try
         for init_try in 1 2; do
-            if ssh_exec "$ip" "$root_pw" 'true' 10 >/dev/null 2>&1 && port_open "$ip" "$SS_PORT"; then
+            if ssh_exec "$SSH_ADDR" "$root_pw" 'true' 10 >/dev/null 2>&1 && port_open "$SSH_ADDR" "$SS_PORT"; then
                 init_ok=1
                 break
             fi
@@ -560,7 +677,7 @@ create_attempt() {
                 '{id:$id, region:$region, plan:$plan, ip:$ip, label:$label, succeeded_at:$now}' \
                 > "$STATE_DIR/last_success.json" 2>/dev/null || true
             # 部署 Tailscale exit node（失败不致命，见函数内告警）(2026-11-06)
-            setup_tailscale_exit "$ip" "$root_pw"
+            setup_tailscale_exit "$SSH_ADDR" "$root_pw"
         else
             log "⚠ 节点未完全就绪，立即注销止损..."
             destroy_instance
@@ -655,11 +772,17 @@ sync_and_update() {
     # 获取第一个实例信息
     local inst
     inst="$(echo "$list" | jq '.instances[0]')"
-    local id ip region plan
+    local id ip v6ip region plan ssh_target
     id="$(echo "$inst" | jq -r '.id')"
     ip="$(echo "$inst" | jq -r '.main_ip')"
+    v6ip="$(echo "$inst" | jq -r '.v6_main_ip // empty')"
+    [[ -z "$v6ip" || "$v6ip" == "null" ]] && v6ip=""
     region="$(echo "$inst" | jq -r '.region')"
     plan="$(echo "$inst" | jq -r '.plan')"
+    # SSH 目标优先用创建时探通的地址（可能是 v6），无记录再退回 v4 main_ip
+    ssh_target="$ip"
+    [[ -f "$INSTANCE_FILE" ]] && ssh_target="$(jq -r '.instance.ssh_addr // .instance.main_ip // empty' "$INSTANCE_FILE" 2>/dev/null || true)"
+    [[ -n "$ssh_target" ]] || ssh_target="$ip"
 
     log "发现实例: id=$id ip=$ip region=$region"
 
@@ -670,8 +793,8 @@ sync_and_update() {
     if [[ -n "$password" ]]; then
         log "SSH 读取 VPS 上的真实 ss 密码..."
         # 顺便放行防火墙并确保 ss 服务运行（幂等，处理 UFW 只放行22的问题）
-        ssh_exec "$ip" "$password" "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; systemctl is-active shadowsocks-libev >/dev/null 2>&1 || systemctl restart shadowsocks-libev >/dev/null 2>&1; true" 8
-        ss_pw="$(ssh_exec "$ip" "$password" "cat /etc/shadowsocks-libev/config.json | jq -r '.password'" 8 2>/dev/null || true)"
+        ssh_exec "$ssh_target" "$password" "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; systemctl is-active shadowsocks-libev >/dev/null 2>&1 || systemctl restart shadowsocks-libev >/dev/null 2>&1; true" 8
+        ss_pw="$(ssh_exec "$ssh_target" "$password" "cat /etc/shadowsocks-libev/config.json | jq -r '.password'" 8 2>/dev/null || true)"
     fi
 
     # 如果 SSH 拿不到，则用本地保存的密码（创建时保存）
@@ -689,7 +812,7 @@ sync_and_update() {
         local password
         password="$(jq -r '.instance.default_password // empty' "$INSTANCE_FILE" 2>/dev/null || true)"
         if [[ -n "$password" ]]; then
-            ssh_exec "$ip" "$password" "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; sed -i 's/\"password\":.*/\"password\": \"$ss_pw\",/' /etc/shadowsocks-libev/config.json && systemctl restart shadowsocks-libev" 8 2>/dev/null || true
+            ssh_exec "$ssh_target" "$password" "ufw allow 8388/tcp >/dev/null 2>&1 || true; ufw allow 8388/udp >/dev/null 2>&1 || true; sed -i 's/\"password\":.*/\"password\": \"$ss_pw\",/' /etc/shadowsocks-libev/config.json && systemctl restart shadowsocks-libev" 8 2>/dev/null || true
         fi
     fi
 
@@ -701,17 +824,18 @@ sync_and_update() {
         rpw="$(jq -r '.instance.default_password // empty' "$INSTANCE_FILE" 2>/dev/null || true)"
     fi
     jq --arg id "$id" --arg ip "$ip" --arg region "$region" --arg plan "$plan" --arg pw "$ss_pw" --arg rpw "$rpw" \
-        '{instance: {id: $id, main_ip: $ip, region: $region, plan: $plan, ss_password: $pw, default_password: $rpw}}' \
+        --arg v6 "$v6ip" --arg saddr "$ssh_target" \
+        '{instance: {id: $id, main_ip: $ip, v6_ip: $v6, ssh_addr: $saddr, region: $region, plan: $plan, ss_password: $pw, default_password: $rpw}}' \
         > "$INSTANCE_FILE" <<< "{}"
     chmod 600 "$INSTANCE_FILE"
 
-    # 更新 clash.yaml
-    update_clash_yaml "$ip" "$ss_pw"
+    # 更新 clash.yaml（v4+v6 双节点）
+    update_clash_yaml "$ip" "$v6ip" "$ss_pw"
 
     # update 能成功说明节点已就绪，标记初始化完成
     set_initialized 1
 
-    log "订阅已更新: $ip ($region)"
+    log "订阅已更新: $ip / v6:${v6ip:-无} ($region)"
     connect
     # 订阅变更后强刷本机 mihomo：provider 重载 + Proxy 钉选（AUTO 组会卡死旧引用）
     refresh_mihomo
@@ -725,19 +849,23 @@ connect() {
     printf '\033[1;33m%s\033[0m\n' "$sub_url"
 
     if [[ -f "$INSTANCE_FILE" ]]; then
-        local ip ss_pw
+        local ip ss_pw v6ip
         ip="$(jq -r '.instance.main_ip // empty' "$INSTANCE_FILE")"
+        v6ip="$(jq -r '.instance.v6_ip // empty' "$INSTANCE_FILE")"
         ss_pw="$(jq -r '.instance.ss_password // empty' "$INSTANCE_FILE")"
-        [[ -n "$ip" ]] && printf '当前节点 IP: %s\n' "$ip"
+        [[ -n "$ip" ]] && printf '当前节点 IP: %s (v6: %s)\n' "$ip" "${v6ip:-无}"
         [[ -n "$ss_pw" ]] && printf 'Shadowsocks 密码: %s\n' "$ss_pw"
     fi
     printf '\n\033[1;33m[手动导入] ss:// 链接:\033[0m\n'
     if [[ -f "$INSTANCE_FILE" ]]; then
-        local ip pw
+        local ip pw v6ip
         ip="$(jq -r '.instance.main_ip // empty' "$INSTANCE_FILE")"
+        v6ip="$(jq -r '.instance.v6_ip // empty' "$INSTANCE_FILE")"
         pw="$(jq -r '.instance.ss_password // empty' "$INSTANCE_FILE")"
-        [[ -n "$ip" && -n "$pw" ]] && printf 'ss://%s@%s:%d#vultr-ss\n' \
+        [[ -n "$ip" && -n "$pw" ]] && printf 'ss://%s@%s:%d#vultr-ss4\n' \
             "$(printf "aes-256-gcm:%s" "$pw" | b64)" "$ip" "$SS_PORT"
+        [[ -n "$v6ip" && "$v6ip" != "null" && -n "$pw" ]] && printf 'ss://%s@%s:%d#vultr-ss6\n' \
+            "$(printf "aes-256-gcm:%s" "$pw" | b64)" "$v6ip" "$SS_PORT"
     fi
     printf '\n'
 }

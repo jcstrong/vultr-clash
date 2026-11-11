@@ -137,9 +137,10 @@ guard_status() {
 
 run_once() {
     # 1. 无节点 → 空闲
-    local id ip
+    local id ip v6ip
     id="$(jq -r '.instance.id // empty' "$INSTANCE_FILE" 2>/dev/null || true)"
     ip="$(jq -r '.instance.main_ip // empty' "$INSTANCE_FILE" 2>/dev/null || true)"
+    v6ip="$(jq -r '.instance.v6_ip // empty' "$INSTANCE_FILE" 2>/dev/null || true)"
     if [[ -z "$id" || -z "$ip" ]]; then
         echo "guard: 无节点，跳过"
         return 0
@@ -160,22 +161,31 @@ run_once() {
         warn "guard: Vultr API 不可达或未授权，跳过本轮（避免本地断网/被墙误判）"
         return 0
     fi
-    local api_ip api_status
+    local api_ip api_status api_v6
     api_ip="$(printf '%s' "$inst" | jq -r '.main_ip // empty')"
     api_status="$(printf '%s' "$inst" | jq -r '.status // empty')"
+    api_v6="$(printf '%s' "$inst" | jq -r '.v6_main_ip // empty')"
     if [[ -n "$api_ip" && "$api_ip" != "$ip" ]]; then
         append_state_log "节点 IP 已变更: $ip → $api_ip，同步更新"
         jq --arg ip "$api_ip" '.instance.main_ip = $ip' "$INSTANCE_FILE" \
             > "$INSTANCE_FILE.tmp" && mv "$INSTANCE_FILE.tmp" "$INSTANCE_FILE"
         ip="$api_ip"
     fi
+    # v6 地址同步（2026-11-12 双栈）
+    if [[ -n "$api_v6" && "$api_v6" != "null" && "$api_v6" != "$v6ip" ]]; then
+        jq --arg v6 "$api_v6" '.instance.v6_ip = $v6' "$INSTANCE_FILE" \
+            > "$INSTANCE_FILE.tmp" && mv "$INSTANCE_FILE.tmp" "$INSTANCE_FILE" 2>/dev/null || true
+        v6ip="$api_v6"
+    fi
     if [[ "$api_status" != "active" && "$api_status" != "pending" ]]; then
         append_state_log "Vultr 实例状态非运行中 (status=$api_status)，跳过本轮评测"
         return 0
     fi
 
-    # 3. 连通性检测：SS 8388 与 SSH 22 都不可达才算"被封"
-    if port_open "$ip" "$SS_PORT" || port_open "$ip" 22; then
+    # 3. 连通性检测：v4/v6 任一栈的 SS 8388 或 SSH 22 可达即算活（2026-11-12 双栈：
+    #    v4 被 null-route/封锁但 v6 正常时不再误杀节点）
+    if port_open "$ip" "$SS_PORT" || port_open "$ip" 22 \
+       || { [[ -n "$v6ip" ]] && (port_open "$v6ip" "$SS_PORT" || port_open "$v6ip" 22); }; then
         local fails
         fails="$(read_fail_count)"
         if (( fails > 0 )); then

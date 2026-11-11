@@ -306,9 +306,17 @@ refresh_mihomo() {
 # 2026-11-10 手动开关制（用户指令）：节点销毁后出口确定性回 DIRECT。
 # 不做自动兜底——魔戒/STC 机场只由 8333 面板开关手动启用。
 set_mihomo_direct() {
+    # fix(2026-11-12): ctl/secret 此前声明未赋值（09c96b9 引入），set -u 下报"未绑定的变量"，
+    # 导致销毁节点后出口无法回 DIRECT、面板状态错乱。赋值方式与 refresh_mihomo 一致。
     local ctl secret now c
+    ctl="${MIHOMO_API:-http://127.0.0.1:9090}"
+    secret="$(grep -m1 '^secret:' "$HOME/.config/mihomo/config.yaml" 2>/dev/null | sed 's/^secret: *//; s/"//g')"
+    if [[ -z "$secret" ]]; then
+        log "ℹ 未找到 mihomo secret，跳过出口回 DIRECT"
+        return 0
+    fi
     now="$(curl -s -m 5 -H "Authorization: Bearer $secret" "$ctl/proxies/Proxy" 2>/dev/null | jq -r '.now // empty' 2>/dev/null)"
-    if [[ -n "$now" && "$now" != "vultr-ss" && "$now" != "null" ]]; then
+    if [[ -n "$now" && "$now" != "vultr-ss" && "$now" != "vultr-ss4" && "$now" != "vultr-ss6" && "$now" != "null" ]]; then
         log "ℹ 出口保持 $now（用户手动选择，销毁不干预）"
         return 0
     fi

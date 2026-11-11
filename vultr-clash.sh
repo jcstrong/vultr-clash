@@ -241,13 +241,15 @@ refresh_mihomo() {
 # 2026-11-10 手动开关制（用户指令）：节点销毁后出口确定性回 DIRECT。
 # 不做自动兜底——魔戒/STC 机场只由 8333 面板开关手动启用。
 set_mihomo_direct() {
-    local ctl secret c
-    ctl="${MIHOMO_API:-http://127.0.0.1:9090}"
-    secret="$(grep -m1 '^secret:' "$HOME/.config/mihomo/config.yaml" 2>/dev/null | sed 's/^secret: *//; s/"//g')"
-    [[ -n "$secret" ]] || return 0
+    local ctl secret now c
+    now="$(curl -s -m 5 -H "Authorization: Bearer $secret" "$ctl/proxies/Proxy" 2>/dev/null | jq -r '.now // empty' 2>/dev/null)"
+    if [[ -n "$now" && "$now" != "vultr-ss" && "$now" != "null" ]]; then
+        log "ℹ 出口保持 $now（用户手动选择，销毁不干预）"
+        return 0
+    fi
     c="$(curl -s -o /dev/null -w '%{http_code}' -m 8 -X PUT -H "Authorization: Bearer $secret" -H 'Content-Type: application/json' -d '{"name":"DIRECT"}' "$ctl/proxies/Proxy" 2>/dev/null || echo 000)"
     if [[ "$c" == 204 ]]; then
-        log "✓ mihomo 出口已回 DIRECT（手动开关制，不自动兜底）"
+        log "✓ mihomo 出口已回 DIRECT（vultr 已死，未动用户手选的机场）"
     else
         log "⚠ mihomo 出口回 DIRECT 未成功 (http=$c)"
     fi

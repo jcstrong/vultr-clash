@@ -9,7 +9,9 @@ Vultr Shadowsocks 节点管理 + Clash 订阅的一体化工具（跨平台：Li
 - **Web 管理界面**：创建、销毁节点，更新订阅，实时查看进度日志
 - **节点状态**：当前节点、套餐、IP、SS 密码、创建用时
 - **费用信息**：账户余额、当前节点费用、历史节点消耗（精确到小时按量计费）
-- **套餐联动**：新泽西(ewr) ↔ $3.5，其他地区 ↔ $5，默认新泽西 + $3.5
+- **套餐联动**：新泽西(ewr) ↔ $3.5，其他地区 ↔ $5，默认新泽西 + $3.5（⚠ 2026-11 起 Vultr 现行镜像最低要求 1GB 内存，$3.5/0.5gb 套餐已装不进任何受支持镜像，建议直接用 $5/1gb）
+- **动态镜像解析**（2026-11-12 新增）：不再写死 os_id，create 时自动解析最新 Ubuntu LTS，按套餐内存自动降级候选，镜像被 Vultr 下架时自愈
+- **v4/v6 全链路双栈**（2026-11-12 新增）：创建即开 IPv6，SSH 部署/探活双栈并行；订阅同时输出 v4/v6 双节点 + 自动切换组，v4 被封或 Vultr 侧 null-route 时 v6 无感接管
 - **首启引导**：未配置 API Key 时自动进入初始化页（填写并校验 Key、一键环境自检）
 - **环境自检**：`/api selftest` 逐个探测 curl/jq/python3/openssl/nc/sshpass/expect/tailscale，并显示平台与 Tailscale IP
 - **订阅服务**：HTTP 提供 `clash.yaml`，Tailscale 内网 / 公网均可访问；可选 token 鉴权（`/sub/{token}/clash.yaml`，轮换后旧链接立即失效）
@@ -20,6 +22,47 @@ Vultr Shadowsocks 节点管理 + Clash 订阅的一体化工具（跨平台：Li
 - **定时任务**：每天自动销毁/创建节点（如凌晨 00:30 销毁止损），结果通过 Bark 推送到手机；管理页展示当前计划
 - **被封自动换区重建**：守卫销毁被封节点后自动在对侧配置重建（新泽西 $3.5 ↔ 日本 $5），订阅随之切换，每日限次防循环，全程 Bark 通知
 - **MCP 服务器**：`mcp_server.py` 把管理能力暴露为 MCP 工具，AI 助手（Claude/OpenClaw 等）可直接查状态/建节点/销毁/看日志
+
+## 2026-11-11 事故复盘与防复发改造（by hermes-agent，commit `55354fd` / `3766282`）
+
+> 本章由 AI 助手 hermes-agent 在修复一次持续两天的「创建全灭」事故后撰写：先讲清事故与根因，再**逐文件标出本次改了什么**。原有工程结构见其余章节。
+
+### 事故现象
+
+11-10 起所有 create 均为「实例创建成功（Vultr status=active）→ SSH 等待 ~100s 超时 → 销毁换区重试 → 六区全灭」，11-11 复现，连续两天无好转；Vultr 侧无任何异常报告。
+
+### 根因（证据链可复现）
+
+1. **同一实例 v4/v6 双栈对照**：v6 秒连 sshd（机器活着、镜像能启动），v4 全黑洞 → 死的是 v4 路径，不是机器；
+2. **check-host.net 全球 16 观测点**测 v4:22 全部超时（含美国→新泽西）→ 排除中国运营商/GFW 封锁，问题在 Vultr 侧；
+3. **`GET /v2/os/2136` 返回 404**：脚本硬编码的镜像已被 Vultr 从目录下架，但创建 API 仍接受该 ID——用它装出的系统 **v4 入站全球性黑洞**（v6 靠 SLAAC 自配正常）。
+
+根因一句话：**镜像 ID 硬编码 + Vultr 静默下架**。附带发现：Vultr 已把所有现行镜像最低内存提到 1GB，`vc2-1c-0.5gb`（ewr $3.5）只能装已淘汰镜像——该套餐事实上报废（这也解释了脚本为何一直沿用老镜像 ID）。
+
+### 改动清单（逐文件，区分新增/修改/修复）
+
+| 文件 | 改动 | commit |
+|---|---|---|
+| `vultr-clash.sh` | **新增**动态镜像解析：`os_lts_candidates` / `resolve_os_for_plan` / `os_id_still_valid` + `.state/os-cache.json` 缓存（每次 create 校验 ID 仍在目录，404 自动重解析）；镜像候选链遇「内存不足」报错自动降级（实测 26.04→24.04→22.04，秒级失败零成本） | `55354fd` |
+| `vultr-clash.sh` | **修改** create 全链路：固定 `enable_ipv6:true`；`wait_for_ssh` v4/v6 并行探测，探通地址写入全局 `SSH_ADDR`，后续 SS 部署/8388 探测/自愈/Tailscale exit 全部走可用栈；`instance.json` 新增 `v6_ip` / `ssh_addr` 字段；IP 等待阶段同时抓 `v6_main_ip` | `55354fd` |
+| `vultr-clash.sh` | **修改** `update_clash_yaml`：输出 `vultr-ss4`(v4) + `vultr-ss6`(v6) 双节点 + `vultr-auto`(url-test) 自动切换组；`connect` 导出双 ss:// 链接 | `55354fd` |
+| `vultr-clash.sh` | **修复** `set_mihomo_direct`：`ctl`/`secret` 声明未赋值（`09c96b9` 引入），`set -u` 下报「未绑定的变量」，导致销毁后出口无法回 DIRECT | `3766282` |
+| `cloud-init.yaml` | SS 监听 `0.0.0.0` → `::`（v4/v6 双栈监听） | `55354fd` |
+| `node-guard.sh` | 探活改**双栈**：v4 或 v6 任一栈的 8388/22 可达即算健康（v4 被 null-route 不再误杀活节点）；从 Vultr API 同步 `v6_main_ip` 到本地状态 | `55354fd` |
+| `~/.config/mihomo/config.yaml`（**非本仓库**，服务器本地配套） | 新增 `vultr-ss` url-test 组（`use: [vultr]`）并加入 Proxy 选择列表 | 配套 |
+
+### 命名约定（重要，勿破坏）
+
+- 订阅（provider）内节点：`vultr-ss4` / `vultr-ss6`；
+- mihomo **主配置**里的自动切换组必须叫 `vultr-ss`：webui 面板白名单、`refresh_mihomo` 钉选、`set_mihomo_direct` 判定全部引用这个名字；provider 节点若也叫 `vultr-ss` 会与组重名导致组自指；
+- 直接订阅 `clash.yaml` 的客户端选 `vultr-auto` 组获得同样的自动切换；
+- mihomo 的 provider 缓存在 clash.yaml 为占位内容时刷新会 503 并保留旧缓存（旧节点名残留的来源），节点重建成功后 `refresh_mihomo` 会强刷消除。
+
+### 已知未做（待拍板）
+
+- ewr $3.5/0.5gb 报废后，`plan_for_region` 与 guard `flip_target`（ewr↔nrt 互换）仍会先撞一次 0.5gb——失败秒级零成本，但建议改成纯 $5 区域环；
+- 「连续 N 天 create 全败 → 熔断停自动重试 + Bark 推诊断结论」防系统性故障空烧；
+- Vultr 账号余额告警（欠费停机是下一种"频繁故障"）。
 
 ## 架构
 
@@ -70,7 +113,7 @@ cd vultr-clash
 
 1. 打开 Web 界面（http://本机IP:8333/）
 2. 首次进入为**初始化页**：粘贴 Vultr API Key → 自动校验 →「环境自检」确认依赖 → 进入管理页
-3. 选择地区/套餐（默认新泽西 + $3.5），点击「创建节点」
+3. 选择地区/套餐（默认新泽西 + $3.5；⚠ 2026-11 起该套餐只能秒败降级，实际会落到 $5 区域），点击「创建节点」
 4. 等待初始化完成（SSH + 8388 就绪后「更新订阅」按钮才可用）
 5. 把页面上的订阅链接填入 Clash / Shadowrocket 即可
 
@@ -91,7 +134,7 @@ chmod 600 .state/sub_token
 
 ### 节点健康守卫（自动销毁被封节点，可选）
 
-节点建立后，可用 cron 每 30 分钟探测节点（SS 8388 / SSH 22）。连续失败 `GUARD_FAILS` 次（默认 2，约 1 小时）即判定“被封”，**自动销毁节点并结算计费**，避免被封 IP 傻等浪费日常费用。
+节点建立后，可用 cron 每 30 分钟探测节点（**v4/v6 双栈**：SS 8388 / SSH 22，任一栈可达即算健康——2026-11-12 起双栈，v4 被 null-route 不再误杀）。连续失败 `GUARD_FAILS` 次（默认 2，约 1 小时）即判定“被封”，**自动销毁节点并结算计费**，避免被封 IP 傻等浪费日常费用。
 
 销毁后自动在对侧配置**重建节点**（新泽西 $3.5 ↔ 日本 $5 互换）：原节点是 ewr/$3.5 就建 nrt/$5，反之亦然；新节点就绪后 clash.yaml 自动切换。防循环保护：每日最多重建 `GUARD_RECREATE_MAX` 次（默认 2），超限只销毁不重建并推送提醒；`GUARD_RECREATE=0` 关闭自动重建。销毁/重建全程 Bark 推送（读取 `.state/schedule.json` 的 `bark_url`）。
 
@@ -212,7 +255,8 @@ bash vultr-clash.sh guard run          # 手动跑一轮
 ## CLI 用法
 
 ```bash
-VULTR_API_KEY=xxx bash vultr-clash.sh create ewr vc2-1c-0.5gb  # 创建
+VULTR_API_KEY=xxx bash vultr-clash.sh create nrt vc2-1c-1gb  # 创建（ewr/0.5gb 已不可用，见事故复盘章）
+VULTR_API_KEY=xxx bash vultr-clash.sh create ewr              # 不带参数时按区域策略选套餐+动态镜像
 VULTR_API_KEY=xxx bash vultr-clash.sh update                   # 同步订阅(从 VPS 读真实密码)
 VULTR_API_KEY=xxx bash vultr-clash.sh destroy                  # 销毁(自动结算计费)
 VULTR_API_KEY=xxx bash vultr-clash.sh connect                  # 打印订阅链接/ss:// 链接

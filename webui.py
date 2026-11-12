@@ -401,8 +401,10 @@ def get_mihomo_status():
         })
     providers.sort(key=lambda x: (not x["has_exit"], x["name"]))
     now = p.get("Proxy", {}).get("now", "")
-    ai = p.get("AI", {}).get("now", "")
-    return {"ok": True, "now": now, "ai": ai, "chain": " → ".join(chain), "exit": exit_node,
+    ai_openai = p.get("AI-OpenAI", {}).get("now", "")
+    ai_claude = p.get("AI-Claude", {}).get("now", "")
+    return {"ok": True, "now": now, "ai_openai": ai_openai, "ai_claude": ai_claude,
+            "chain": " → ".join(chain), "exit": exit_node,
             "providers": providers}
 
 def set_mihomo_exit(target, group="Proxy"):
@@ -437,7 +439,7 @@ def get_ai_routes():
     返回每个站点实际出口 IP 与国家——让"走的是哪"可见（2026-11-12 用户需求）"""
     import urllib.request
     from concurrent.futures import ThreadPoolExecutor
-    targets = [("ChatGPT", "chatgpt.com"), ("Codex", "api.openai.com"), ("Claude", "claude.ai")]
+    targets = [("Codex/ChatGPT", "api.openai.com"), ("Claude", "claude.ai")]
     op = urllib.request.build_opener(urllib.request.ProxyHandler(
         {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}))
 
@@ -1015,10 +1017,14 @@ select:focus{outline:none;border-color:var(--accent)}
       <span class="node-status on" title="点击重新实测" onclick="loadAI()" style="cursor:pointer">实测</span>
     </div>
     <div style="padding:12px 12px 0;display:flex;align-items:center;justify-content:space-between">
-      <span style="font-size:14px">AI 专用开关</span>
-      <label class="switch"><input type="checkbox" id="swAI" onchange="toggleAI()"><span class="slider"></span></label>
+      <span style="font-size:14px">Codex/ChatGPT 走魔戒</span>
+      <label class="switch"><input type="checkbox" id="swCodex" onchange="toggleAI('openai')"><span class="slider"></span></label>
     </div>
-    <div style="padding:6px 12px 0;font-size:12px;color:var(--muted)">开 = AI 走魔戒（过风控）· 关 = AI 走 vultr（省流量）</div>
+    <div style="padding:6px 12px 0;display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:14px">Claude 走魔戒(非港)</span>
+      <label class="switch"><input type="checkbox" id="swClaude" onchange="toggleAI('claude')"><span class="slider"></span></label>
+    </div>
+    <div style="padding:6px 12px 0;font-size:12px;color:var(--muted)">开 = 走魔戒过风控 · 关 = 走 vultr（注：vultr 段已被 OpenAI/Claude 风控，仅应急）</div>
     <div id="aiRows" style="padding:12px;font-size:13px;display:flex;flex-direction:column;gap:10px">实测中…</div>
     <div style="padding:0 12px 10px;font-size:12px;color:var(--muted)">经 mihomo 当前规则实测各站点真实出口 IP 与国家；❌ = 该路不通（换出口再试）</div>
   </div>
@@ -1385,9 +1391,12 @@ async function loadAI() {
     const sr = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({action:"status"})});
     const sj = await sr.json();
-    aiExitNow = (sj.mihomo && sj.mihomo.ai) || '';
-    const sw = document.getElementById('swAI');
-    if (sw) sw.checked = (aiExitNow === '魔戒');
+    const mo = (sj.mihomo && sj.mihomo.ai_openai) || '';
+    const mc = (sj.mihomo && sj.mihomo.ai_claude) || '';
+    aiExitNow = mc;  // 兼容旧变量
+    const so = document.getElementById('swCodex'), sc = document.getElementById('swClaude');
+    if (so) so.checked = (mo === '魔戒');
+    if (sc) sc.checked = (mc === '魔戒AI');
   } catch(e) {}
   if (box) box.textContent = '实测中…';
   try {
@@ -1411,14 +1420,13 @@ async function loadAI() {
     }
   } catch(e) { if (box) box.textContent = '实测失败: ' + e.message; }
 }
-async function toggleAI() {
-  const sw = document.getElementById('swAI');
+async function toggleAI(family) {
+  const sw = document.getElementById(family === 'openai' ? 'swCodex' : 'swClaude');
   if (!sw || sw.disabled) return;
-  const target = sw.checked ? '魔戒' : 'vultr-ss';
   sw.disabled = true;
   try {
     const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({action:"ai-exit", target})});
+      body: JSON.stringify({action:"ai-exit", family: family, on: sw.checked})});
     const j = await r.json();
     if (!j.ok) { alert('切换失败: ' + (j.output || '未知错误')); }
   } catch(e) { alert('切换失败: ' + e.message); }
@@ -1508,11 +1516,14 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "ai-routes":
             resp = get_ai_routes()
         elif action == "ai-exit":
-            target = (data.get("target") or "").strip()
-            if target not in ("魔戒", "vultr-ss"):
-                resp = {"ok": False, "output": "AI 组仅支持 魔戒/vultr-ss: " + target}
+            family = (data.get("family") or "").strip()
+            on = bool(data.get("on"))
+            groups = {"openai": "AI-OpenAI", "claude": "AI-Claude"}
+            targets = {"openai": "魔戒", "claude": "魔戒AI"}
+            if family not in groups:
+                resp = {"ok": False, "output": "AI family 仅支持 openai/claude: " + family}
             else:
-                resp = set_mihomo_exit(target, group="AI")
+                resp = set_mihomo_exit(targets[family] if on else "vultr-ss", group=groups[family])
         elif action == "getlog":
             resp = {"ok": True, "log": read_log()}
         elif action == "isbusy":

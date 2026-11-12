@@ -401,11 +401,12 @@ def get_mihomo_status():
         })
     providers.sort(key=lambda x: (not x["has_exit"], x["name"]))
     now = p.get("Proxy", {}).get("now", "")
-    return {"ok": True, "now": now, "chain": " → ".join(chain), "exit": exit_node,
+    ai = p.get("AI", {}).get("now", "")
+    return {"ok": True, "now": now, "ai": ai, "chain": " → ".join(chain), "exit": exit_node,
             "providers": providers}
 
-def set_mihomo_exit(target):
-    """面板手动开关：PUT mihomo Proxy 组出口（DIRECT/魔戒/STC/vultr-ss），不做任何自动兜底"""
+def set_mihomo_exit(target, group="Proxy"):
+    """面板手动开关：PUT mihomo 组选择（Proxy 主出口 / AI 专用组），不做任何自动兜底"""
     import urllib.request
     cfg = os.path.expanduser("~/.config/mihomo/config.yaml")
     secret = ""
@@ -418,20 +419,49 @@ def set_mihomo_exit(target):
     except OSError:
         pass
     req = urllib.request.Request(
-        "http://127.0.0.1:9090/proxies/Proxy",
+        "http://127.0.0.1:9090/proxies/" + group,
         data=json.dumps({"name": target}).encode("utf-8"),
         headers={"Authorization": "Bearer " + secret,
                  "Content-Type": "application/json"},
         method="PUT")
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
-            code = r.status
+            r.status  # 非 2xx 会抛 HTTPError 走 except
     except Exception as e:
         return {"ok": False, "output": str(e)[:160]}
-    if not (200 <= code < 300):
-        return {"ok": False, "output": "mihomo API 返回 " + str(code)}
-    append_log("🎚 出口切换 → " + target)
+    append_log("🎚 出口切换 → " + target + ("（AI组）" if group == "AI" else ""))
     return {"ok": True, "mihomo": get_mihomo_status()}
+
+def get_ai_routes():
+    """AI 站点实测路由：经 mihomo(127.0.0.1:7890) 访问各站点 Cloudflare trace 端点，
+    返回每个站点实际出口 IP 与国家——让"走的是哪"可见（2026-11-12 用户需求）"""
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+    targets = [("ChatGPT", "chatgpt.com"), ("Codex", "api.openai.com"), ("Claude", "claude.ai")]
+    op = urllib.request.build_opener(urllib.request.ProxyHandler(
+        {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}))
+
+    def _probe(pair):
+        name, host = pair
+        item = {"name": name, "host": host, "ok": False, "ip": "", "loc": "", "err": ""}
+        try:
+            req = urllib.request.Request("https://" + host + "/cdn-cgi/trace",
+                                         headers={"User-Agent": "curl/8"})
+            with op.open(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            for line in body.splitlines():
+                if line.startswith("ip="):
+                    item["ip"] = line[3:]
+                elif line.startswith("loc="):
+                    item["loc"] = line[4:]
+            item["ok"] = bool(item["ip"])
+        except Exception as e:
+            item["err"] = str(e)[:80]
+        return item
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        routes = list(ex.map(_probe, targets))
+    return {"ok": True, "routes": routes}
 
 def render_page():
     values = {
@@ -979,6 +1009,20 @@ select:focus{outline:none;border-color:var(--accent)}
     <div style="padding:0 12px 12px;font-size:12px;color:var(--muted)" id="exitHint">…</div>
   </div>
 
+  <div class="node-card" id="aiCard">
+    <div class="node-header">
+      <span class="node-name">🤖 AI 站点路由</span>
+      <span class="node-status on" title="点击重新实测" onclick="loadAI()" style="cursor:pointer">实测</span>
+    </div>
+    <div style="padding:12px 12px 0;display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:14px">AI 专用开关</span>
+      <label class="switch"><input type="checkbox" id="swAI" onchange="toggleAI()"><span class="slider"></span></label>
+    </div>
+    <div style="padding:6px 12px 0;font-size:12px;color:var(--muted)">开 = AI 走魔戒（过风控）· 关 = AI 走 vultr（省流量）</div>
+    <div id="aiRows" style="padding:12px;font-size:13px;display:flex;flex-direction:column;gap:10px">实测中…</div>
+    <div style="padding:0 12px 10px;font-size:12px;color:var(--muted)">经 mihomo 当前规则实测各站点真实出口 IP 与国家；❌ = 该路不通（换出口再试）</div>
+  </div>
+
 </div>
 
 <!-- API Key 弹窗 -->
@@ -1334,11 +1378,58 @@ async function toggleExit(name) {
   if (!j.ok) alert('切换失败: ' + (j.output || '未知错误'));
   loadExit(); loadStatus();
 }
+let aiExitNow = '';
+async function loadAI() {
+  const box = document.getElementById('aiRows');
+  try {
+    const sr = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"status"})});
+    const sj = await sr.json();
+    aiExitNow = (sj.mihomo && sj.mihomo.ai) || '';
+    const sw = document.getElementById('swAI');
+    if (sw) sw.checked = (aiExitNow === '魔戒');
+  } catch(e) {}
+  if (box) box.textContent = '实测中…';
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"ai-routes"})});
+    const j = await r.json();
+    if (box) {
+      box.textContent = '';
+      (j.routes || []).forEach(t => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;justify-content:space-between;align-items:center';
+        const nm = document.createElement('span');
+        nm.textContent = t.name;
+        const st = document.createElement('span');
+        st.style.cssText = 'font-family:ui-monospace,monospace;font-size:12px';
+        st.textContent = t.ok ? ('✅ ' + t.ip + ' · ' + t.loc) : ('❌ 无连接' + (t.err ? '（' + t.err + '）' : ''));
+        if (t.err && t.ok) st.title = t.err;
+        row.appendChild(nm); row.appendChild(st);
+        box.appendChild(row);
+      });
+    }
+  } catch(e) { if (box) box.textContent = '实测失败: ' + e.message; }
+}
+async function toggleAI() {
+  const sw = document.getElementById('swAI');
+  if (!sw || sw.disabled) return;
+  const target = sw.checked ? '魔戒' : 'vultr-ss';
+  sw.disabled = true;
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"ai-exit", target})});
+    const j = await r.json();
+    if (!j.ok) { alert('切换失败: ' + (j.output || '未知错误')); }
+  } catch(e) { alert('切换失败: ' + e.message); }
+  loadAI();
+}
 loadStatus();
 loadCost();
 loadLog();
 loadSchedule();
 loadExit();
+loadAI();
 
 // 操作执行期间由 doAction 内部轮询日志；无操作时不再自动刷新
 </script>
@@ -1414,6 +1505,14 @@ class Handler(BaseHTTPRequestHandler):
                 resp = {"ok": False, "output": "非法出口: " + target}
             else:
                 resp = set_mihomo_exit(target)
+        elif action == "ai-routes":
+            resp = get_ai_routes()
+        elif action == "ai-exit":
+            target = (data.get("target") or "").strip()
+            if target not in ("魔戒", "vultr-ss"):
+                resp = {"ok": False, "output": "AI 组仅支持 魔戒/vultr-ss: " + target}
+            else:
+                resp = set_mihomo_exit(target, group="AI")
         elif action == "getlog":
             resp = {"ok": True, "log": read_log()}
         elif action == "isbusy":

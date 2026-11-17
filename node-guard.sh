@@ -223,6 +223,24 @@ run_once() {
         write_fail_count 0
 
         # --- 被封自动重建：换到对侧地区/套餐（新泽西$3.5 ↔ 日本$5）---
+        # 2026-11-18 两项防误重建：
+        #  A. 从未就绪的僵尸记录（initialized!=1）只清理不重建——不是被封，重建无意义
+        if [[ "$initialized" != "1" ]]; then
+            append_state_log "ℹ 节点从未就绪（initialized=$initialized），仅清理僵尸记录，不自动重建"
+            return 0
+        fi
+        #  B. 定时销毁（00:30）刚执行过（schedule.json 10 分钟内更新且 last_destroy_date=今天）
+        #     → 这是用户设计的夜间省钱销毁，不是被封，不得自动重建推翻
+        if [[ "$(jq -r '.last_destroy_date // ""' "$SCHEDULE_FILE" 2>/dev/null)" == "$(date +%F)" ]]; then
+            local sched_mtime sched_age
+            sched_mtime="$(stat -c %Y "$SCHEDULE_FILE" 2>/dev/null || echo 0)"
+            sched_age=$(( $(date +%s) - sched_mtime ))
+            if (( sched_age < 600 )); then
+                append_state_log "ℹ 定时销毁刚执行（秒差=$sched_age），尊重夜间销毁设计，跳过自动重建"
+                bark_push "ℹ 跳过自动重建" "定时销毁刚执行（非被封），不自动重建，明早手动 create"
+                return 0
+            fi
+        fi
         if [[ "$GUARD_RECREATE" == "1" && -n "$plan" ]]; then
             local rc_today rc_max target t_region t_plan create_rc
             rc_today="$(read_recreates_today)"

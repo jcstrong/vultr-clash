@@ -988,6 +988,8 @@ select:focus{outline:none;border-color:var(--accent)}
       <dt>自动销毁</dt><dd id="scDestroy">加载中…</dd>
       <dt>自动创建</dt><dd id="scCreate">加载中…</dd>
       <dt>销毁通知</dt><dd id="scBark">加载中…</dd>
+      <dt>阻止自动注销</dt>
+      <dd><label class="switch" title="开启后：00:30 定时销毁跳过、guard 不再自动销毁/重建，节点持续计费"><input type="checkbox" id="swKeep" onchange="toggleKeep()"><span class="slider"></span></label></dd>
     </dl>
   </div>
 
@@ -1014,10 +1016,6 @@ select:focus{outline:none;border-color:var(--accent)}
         <span style="font-size:14px">STC机场</span>
         <label class="switch"><input type="checkbox" id="swStc" onchange="toggleExit('STC')"><span class="slider"></span></label>
       </div>
-    </div>
-    <div style="padding:6px 12px 0;display:flex;align-items:center;justify-content:space-between">
-      <span style="font-size:14px" title="开启后：00:30 定时销毁跳过、guard 不再自动销毁/重建">🔒 阻止自动注销节点</span>
-      <label class="switch"><input type="checkbox" id="swKeep" onchange="toggleKeep()"><span class="slider"></span></label>
     </div>
     <div style="padding:6px 12px 0;font-size:12px;color:var(--muted)" id="exitHint">…</div>
   </div>
@@ -1351,7 +1349,7 @@ async function loadSchedule() {
     const s = j.schedule || {};
     const on = s.enabled !== false;
     document.getElementById('scDestroy').textContent =
-      (on && s.destroy_time) ? ('每天 ' + s.destroy_time + '（销毁并结算计费）') : '未启用';
+      (on && s.destroy_time) ? ('每天 ' + s.destroy_time + (typeof keepNodeOn !== 'undefined' && keepNodeOn ? '（已关闭）' : '（销毁并结算计费）')) : '未启用';
     document.getElementById('scCreate').textContent =
       (on && s.create_time) ? ('每天 ' + s.create_time) : '未启用（预留）';
     document.getElementById('scBark').textContent =
@@ -1368,6 +1366,7 @@ document.getElementById('keyInput').addEventListener('keydown', e => {
 
 // 初始加载（各页首次各请求一次，后续用户手动刷新）
 let currentExit = '';
+let keepNodeOn = false;
 async function loadExit() {
   try {
     const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
@@ -1379,14 +1378,13 @@ async function loadExit() {
     if (el) el.textContent = '出口: ' + currentExit + ((mh.exit && mh.exit !== currentExit) ? ' → ' + mh.exit : '');
     const vultrRunning = !!(j.instance && j.instance.status === 'active' && j.instance.power_status === 'running');
     const m = document.getElementById('swMojie'), s = document.getElementById('swStc');
-    if (m) { m.checked = (currentExit === '魔戒'); m.disabled = vultrRunning; }
-    if (s) { s.checked = (currentExit === 'STC'); s.disabled = vultrRunning; }
+    if (m) { m.checked = (currentExit === '魔戒'); m.disabled = false; }
+    if (s) { s.checked = (currentExit === 'STC'); s.disabled = false; }
     const sk = document.getElementById('swKeep');
     if (sk) { sk.checked = !!j.keep_node; sk.disabled = false; }
+    keepNodeOn = !!j.keep_node;
     const hint = document.getElementById('exitHint');
-    if (hint) hint.textContent = vultrRunning
-      ? 'vultr 运行中，无需兜底（开关已自动关闭）'
-      : '打开即接管全部代理流量；关闭回直连 DIRECT。tailscale / opencode.ai 永远直连，不受影响。';
+    if (hint) hint.textContent = '当前主出口：' + (currentExit || '未知') + (vultrRunning ? '（vultr 运行中，可随时拨机场接管）' : '（无 vultr 节点）') + '；关闭开关回 DIRECT。tailscale / opencode.ai 永远直连。';
   } catch(e) {}
 }
 async function toggleExit(name) {
@@ -1408,9 +1406,8 @@ async function loadAI() {
     const mc = (sj.mihomo && sj.mihomo.ai_claude) || '';
     aiExitNow = mc;  // 兼容旧变量
     const so = document.getElementById('swCodex'), sc = document.getElementById('swClaude');
-    const vultrRunning2 = !!(sj.instance && sj.instance.status === 'active' && sj.instance.power_status === 'running');
-    if (so) { so.checked = (mo === '魔戒'); so.disabled = vultrRunning2; }
-    if (sc) { sc.checked = (mc === '魔戒AI'); sc.disabled = vultrRunning2; }
+    if (so) { so.checked = (mo === '魔戒'); so.disabled = false; }
+    if (sc) { sc.checked = (mc === '魔戒AI'); sc.disabled = false; }
   } catch(e) {}
   if (box) box.textContent = '实测中…';
   try {
@@ -1445,6 +1442,7 @@ async function toggleKeep() {
     if (!j.ok) alert('切换失败: ' + (j.output || '未知错误'));
   } catch(e) { alert('切换失败: ' + e.message); }
   loadExit();
+  loadSchedule();
 }
 async function toggleAI(family) {
   const sw = document.getElementById(family === 'openai' ? 'swCodex' : 'swClaude');

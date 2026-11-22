@@ -214,6 +214,12 @@ run_once() {
         local plan region
         plan="$(printf '%s' "$inst" | jq -r '.plan // empty')"
         region="$(printf '%s' "$inst" | jq -r '.region // empty')"
+        # 🔒 节点保护开关（2026-11-22）：开启时 guard 只记录不销毁——阻止一切自动注销
+        if [[ -f "$STATE_DIR/keep_node" ]]; then
+            append_state_log "🔒 节点保护开启：节点 $ip 不可达但不自动销毁（用户锁定，仅记录）"
+            bark_push "🔒 节点保护中" "节点 ${ip} 探活失败但保护开关开启，未销毁——请手动检查"
+            return 0
+        fi
         append_state_log "节点疑似被封，自动销毁..."
         bark_push "❌ 节点被封，已自动销毁" "${region:-未知}/${plan:-未知} 节点 ${ip} 连续 ${GUARD_FAILS} 轮不可达，销毁止损"
         VULTR_API_KEY="$VULTR_API_KEY" bash "$SCRIPT" destroy \

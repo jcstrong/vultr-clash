@@ -21,6 +21,8 @@ TIME_FILE = os.path.join(BASE_DIR, ".state", "create-duration.txt")
 BILL_FILE = os.path.join(BASE_DIR, ".state", "billing.json")
 LAST_SUCCESS_FILE = os.path.join(BASE_DIR, ".state", "last_success.json")
 SUB_URL = os.environ.get("SUB_URL", "http://localhost:8888/sub/clash.yaml")
+# 节点保护开关（2026-11-22）：存在即阻止一切自动注销（定时销毁 + guard 被封销毁）
+KEEP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".state", "keep_node")
 STATE_DIR = os.path.join(BASE_DIR, ".state")
 TOKEN_FILE = os.path.join(STATE_DIR, "sub_token")
 SUB_CLASH_PATH = os.environ.get("SUB_PATH", "/sub/clash.yaml").lstrip("/")
@@ -749,18 +751,23 @@ def scheduler_loop():
                         sched["last_destroy_date"] = today
                         save_schedule(sched)
                     elif exists is True:
-                        res = run_action("destroy")
-                        busy = res.get("exit") == -1 and "正在执行" in (res.get("output") or "")
-                        if not busy:
+                        if os.path.exists(KEEP_FILE):
+                            append_log(f"🔒 {dt} 定时销毁：节点保护开关开启，跳过（节点保留，继续计费）")
                             sched["last_destroy_date"] = today
                             save_schedule(sched)
-                            if res.get("ok"):
-                                bark_notify("✅ 节点已自动销毁",
-                                            f"定时任务（{dt}）已销毁节点并结算计费{total_spent_str()}，订阅已停止")
-                            else:
-                                bark_notify("❌ 自动销毁失败",
-                                            ((res.get("output") or "")[:200] or "详见管理页日志") + " — 节点仍在计费，请手动处理")
-                        # busy：不标记日期，20 秒后在本分钟内重试
+                        else:
+                            res = run_action("destroy")
+                            busy = res.get("exit") == -1 and "正在执行" in (res.get("output") or "")
+                            if not busy:
+                                sched["last_destroy_date"] = today
+                                save_schedule(sched)
+                                if res.get("ok"):
+                                    bark_notify("✅ 节点已自动销毁",
+                                                f"定时任务（{dt}）已销毁节点并结算计费{total_spent_str()}，订阅已停止")
+                                else:
+                                    bark_notify("❌ 自动销毁失败",
+                                                ((res.get("output") or "")[:200] or "详见管理页日志") + " — 节点仍在计费，请手动处理")
+                            # busy：不标记日期，20 秒后在本分钟内重试
 
                 # ---- 自动创建（预留）----
                 ct = (sched.get("create_time") or "").strip()
@@ -1008,7 +1015,11 @@ select:focus{outline:none;border-color:var(--accent)}
         <label class="switch"><input type="checkbox" id="swStc" onchange="toggleExit('STC')"><span class="slider"></span></label>
       </div>
     </div>
-    <div style="padding:0 12px 12px;font-size:12px;color:var(--muted)" id="exitHint">…</div>
+    <div style="padding:6px 12px 0;display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:14px" title="开启后：00:30 定时销毁跳过、guard 不再自动销毁/重建">🔒 阻止自动注销节点</span>
+      <label class="switch"><input type="checkbox" id="swKeep" onchange="toggleKeep()"><span class="slider"></span></label>
+    </div>
+    <div style="padding:6px 12px 0;font-size:12px;color:var(--muted)" id="exitHint">…</div>
   </div>
 
   <div class="node-card" id="aiCard">
@@ -1397,6 +1408,8 @@ async function loadAI() {
     const so = document.getElementById('swCodex'), sc = document.getElementById('swClaude');
     if (so) so.checked = (mo === '魔戒');
     if (sc) sc.checked = (mc === '魔戒AI');
+    const sk = document.getElementById('swKeep');
+    if (sk) sk.checked = !!j.keep_node;
   } catch(e) {}
   if (box) box.textContent = '实测中…';
   try {
@@ -1419,6 +1432,18 @@ async function loadAI() {
       });
     }
   } catch(e) { if (box) box.textContent = '实测失败: ' + e.message; }
+}
+async function toggleKeep() {
+  const sw = document.getElementById('swKeep');
+  if (!sw || sw.disabled) return;
+  sw.disabled = true;
+  try {
+    const r = await fetch("/api", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"keep-node", on: sw.checked})});
+    const j = await r.json();
+    if (!j.ok) alert('切换失败: ' + (j.output || '未知错误'));
+  } catch(e) { alert('切换失败: ' + e.message); }
+  loadExit();
 }
 async function toggleAI(family) {
   const sw = document.getElementById(family === 'openai' ? 'swCodex' : 'swClaude');
@@ -1524,6 +1549,19 @@ class Handler(BaseHTTPRequestHandler):
                 resp = {"ok": False, "output": "AI family 仅支持 openai/claude: " + family}
             else:
                 resp = set_mihomo_exit(targets[family] if on else "vultr-ss", group=groups[family])
+        elif action == "keep-node":
+            on = bool(data.get("on"))
+            try:
+                if on:
+                    open(KEEP_FILE, "w").write(time.strftime("%F %T"))
+                    append_log("🔒 节点保护已开启：定时销毁与 guard 自动销毁全部让路")
+                else:
+                    if os.path.exists(KEEP_FILE):
+                        os.remove(KEEP_FILE)
+                    append_log("🔓 节点保护已关闭：恢复自动销毁机制")
+                resp = {"ok": True, "keep_node": on}
+            except Exception as e:
+                resp = {"ok": False, "output": str(e)[:120]}
         elif action == "getlog":
             resp = {"ok": True, "log": read_log()}
         elif action == "isbusy":
@@ -1551,7 +1589,7 @@ class Handler(BaseHTTPRequestHandler):
             sub_url = resolve_sub_url()
             try:
                 resp = {"ok": True, "instance": get_instance_status(), "subscription_url": sub_url,
-                        "mihomo": get_mihomo_status()}
+                        "mihomo": get_mihomo_status(), "keep_node": os.path.exists(KEEP_FILE)}
             except Exception as e:
                 resp = {"ok": False, "output": str(e), "subscription_url": sub_url}
         elif action in ["create", "destroy", "update"]:

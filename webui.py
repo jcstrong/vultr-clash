@@ -1381,6 +1381,8 @@ async function loadExit() {
     const m = document.getElementById('swMojie'), s = document.getElementById('swStc');
     if (m) { m.checked = (currentExit === '魔戒'); m.disabled = vultrRunning; }
     if (s) { s.checked = (currentExit === 'STC'); s.disabled = vultrRunning; }
+    const sk = document.getElementById('swKeep');
+    if (sk) { sk.checked = !!j.keep_node; sk.disabled = false; }
     const hint = document.getElementById('exitHint');
     if (hint) hint.textContent = vultrRunning
       ? 'vultr 运行中，无需兜底（开关已自动关闭）'
@@ -1406,10 +1408,9 @@ async function loadAI() {
     const mc = (sj.mihomo && sj.mihomo.ai_claude) || '';
     aiExitNow = mc;  // 兼容旧变量
     const so = document.getElementById('swCodex'), sc = document.getElementById('swClaude');
-    if (so) so.checked = (mo === '魔戒');
-    if (sc) sc.checked = (mc === '魔戒AI');
-    const sk = document.getElementById('swKeep');
-    if (sk) sk.checked = !!j.keep_node;
+    const vultrRunning2 = !!(sj.instance && sj.instance.status === 'active' && sj.instance.power_status === 'running');
+    if (so) { so.checked = (mo === '魔戒'); so.disabled = vultrRunning2; }
+    if (sc) { sc.checked = (mc === '魔戒AI'); sc.disabled = vultrRunning2; }
   } catch(e) {}
   if (box) box.textContent = '实测中…';
   try {

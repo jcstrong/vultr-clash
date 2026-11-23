@@ -1349,7 +1349,7 @@ async function loadSchedule() {
     const s = j.schedule || {};
     const on = s.enabled !== false;
     document.getElementById('scDestroy').textContent =
-      (on && s.destroy_time) ? ('每天 ' + s.destroy_time + (typeof keepNodeOn !== 'undefined' && keepNodeOn ? '（已关闭）' : '（销毁并结算计费）')) : '未启用';
+      (on && s.destroy_time) ? ('每天 ' + s.destroy_time + (typeof keepNodeOn !== 'undefined' && keepNodeOn ? '（已关闭）' : '（已开启）')) : '未启用';
     document.getElementById('scCreate').textContent =
       (on && s.create_time) ? ('每天 ' + s.create_time) : '未启用（预留）';
     document.getElementById('scBark').textContent =

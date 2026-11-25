@@ -988,8 +988,11 @@ select:focus{outline:none;border-color:var(--accent)}
       <dt>自动销毁</dt><dd id="scDestroy">加载中…</dd>
       <dt>自动创建</dt><dd id="scCreate">加载中…</dd>
       <dt>销毁通知</dt><dd id="scBark">加载中…</dd>
-      <dt>阻止自动注销</dt>
-      <dd><label class="switch" title="开启后：00:30 定时销毁跳过、guard 不再自动销毁/重建，节点持续计费"><input type="checkbox" id="swKeep" onchange="toggleKeep()"><span class="slider"></span></label></dd>
+      <dt>节点保护</dt>
+      <dd style="display:flex;align-items:center;gap:10px">
+        <label class="switch" title="开启后：00:30 定时销毁与 guard 自动销毁全部跳过，节点持续计费；手动销毁不受影响"><input type="checkbox" id="swKeep" onchange="toggleKeep()"><span class="slider"></span></label>
+        <span id="keepHint" style="font-size:12px;color:var(--muted)">加载中…</span>
+      </dd>
     </dl>
   </div>
 
@@ -1347,9 +1350,16 @@ async function loadSchedule() {
       body: JSON.stringify({action:"schedule"})});
     const j = await r.json();
     const s = j.schedule || {};
+    const keep = !!j.keep_node;   // 权威状态随本响应返回，不再依赖 loadExit 的时序
+    keepNodeOn = keep;
     const on = s.enabled !== false;
-    document.getElementById('scDestroy').textContent =
-      (on && s.destroy_time) ? ('每天 ' + s.destroy_time + (typeof keepNodeOn !== 'undefined' && keepNodeOn ? '（已关闭）' : '（已开启）')) : '未启用';
+    const dEl = document.getElementById('scDestroy');
+    if (on && s.destroy_time) {
+      dEl.textContent = '每天 ' + s.destroy_time + (keep ? '（受保护，跳过销毁）' : '（正常执行）');
+      dEl.style.color = keep ? '#4ade80' : '';
+    } else { dEl.textContent = '未启用'; dEl.style.color = ''; }
+    const kh = document.getElementById('keepHint');
+    if (kh) kh.textContent = keep ? '保护中：到点不销毁，guard 不重建' : (on ? '未保护：到点正常销毁' : '未保护：定时销毁未启用');
     document.getElementById('scCreate').textContent =
       (on && s.create_time) ? ('每天 ' + s.create_time) : '未启用（预留）';
     document.getElementById('scBark').textContent =
@@ -1583,7 +1593,7 @@ class Handler(BaseHTTPRequestHandler):
                 "destroy_time": (sched.get("destroy_time") or "").strip(),
                 "create_time": (sched.get("create_time") or "").strip(),
                 "bark_configured": bool((sched.get("bark_url") or "").strip()),
-            }}
+            }, "keep_node": os.path.exists(KEEP_FILE)}
         elif action in ["connect", "status"]:
             sub_url = resolve_sub_url()
             try:
